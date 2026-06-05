@@ -7,6 +7,7 @@ continuously.  Designed to survive terminal disconnection via daemonization
 Usage (from cli.py):
     workflow-monitor --serve [--log PATH] TARGET
 """
+
 from __future__ import annotations
 
 import os
@@ -17,9 +18,15 @@ from pathlib import Path
 from typing import Optional
 
 from .braindump import WorkflowInfo
-from .db import StampedeDB, WorkflowSnapshot, fmt_duration
+from .db import StampedeDB, WorkflowSnapshot
 from .event_log import EventLogger
-from .htcondor_poll import query_queue, query_history, query_slots, PoolSummary
+from .htcondor_poll import (
+    CondorBackoff,
+    PoolSummary,
+    query_history,
+    query_queue,
+    query_slots,
+)
 
 
 def _daemonize(pid_file: Path) -> None:
@@ -75,8 +82,17 @@ def run_server(
     condor_constraint: Optional[str] = None,
     foreground: bool = False,
     diagnose: bool = False,
+    min_free_mb: float = 200.0,
+    max_log_mb: Optional[float] = None,
 ) -> None:
     """Run the headless monitoring server.
+
+    The loop reads the local stampede.db every cycle.  The live HTCondor queue
+    is polled through a :class:`~.htcondor_poll.CondorBackoff` gate: when the
+    scheduler becomes unreachable or overloaded the condor poll cadence backs
+    off exponentially (the local DB/loop cadence is unaffected) so the monitor
+    never piles load onto a struggling schedd, snapping back to the base
+    interval as soon as a query succeeds.
 
     Parameters
     ----------
@@ -87,6 +103,8 @@ def run_server(
     condor_kwargs:     Extra kwargs forwarded to htcondor_poll.query_queue().
     condor_constraint: Optional HTCondor ClassAd constraint for live queue.
     foreground:        If True, run in foreground (don't daemonize).
+    min_free_mb:       Pause event logging below this much free space (MB).
+    max_log_mb:        Optional hard cap on the JSONL size (MB); None = unbounded.
     """
     ck = condor_kwargs or {}
 
@@ -116,7 +134,9 @@ def run_server(
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    logger = EventLogger(info, db, log_path=log_path)
+    logger = EventLogger(
+        info, db, log_path=log_path, min_free_mb=min_free_mb, max_log_mb=max_log_mb
+    )
 
     diag_engine = None
     if diagnose:
@@ -133,11 +153,36 @@ def run_server(
         )
         print(f"Diagnostics enabled — sidecar: {diag_path}")
 
+    # Adaptive gate: keep the loop (stampede.db) at base cadence, but poll the
+    # condor queue less often when the scheduler is failing.  Cache the last
+    # good result so a gated/failed cycle reuses it (and the fingerprint dedup
+    # emits nothing new) rather than flapping to an empty queue.
+    condor_backoff = CondorBackoff(poll_interval)
+    last_condor_jobs: list = []
+
     def _poll_condor():
+        nonlocal last_condor_jobs
+        now = time.time()
+        if not condor_backoff.due(now):
+            return last_condor_jobs  # gated — do not hit a struggling schedd
         try:
-            return query_queue(constraint=condor_constraint, **ck)
-        except Exception:
-            return []
+            jobs = query_queue(constraint=condor_constraint, raise_on_error=True, **ck)
+        except Exception as exc:
+            if condor_backoff.fail_streak == 0:
+                print(
+                    f"[backoff] condor query failed ({exc}); polling less "
+                    f"frequently until the scheduler recovers",
+                    file=sys.stderr,
+                )
+            condor_backoff.record(False, now)
+            return last_condor_jobs
+        if condor_backoff.record(True, now):
+            print(
+                "[backoff] condor reachable again; resuming normal poll cadence",
+                file=sys.stderr,
+            )
+        last_condor_jobs = jobs
+        return jobs
 
     # History cache with throttled polling
     history_cache: list = []
@@ -147,6 +192,10 @@ def run_server(
     def _poll_history():
         nonlocal history_cache, history_last_poll
         now = time.time()
+        # While the scheduler is failing, skip history too — don't pile more
+        # (already-throttled) queries onto a struggling schedd.
+        if condor_backoff.fail_streak > 0:
+            return history_cache
         if now - history_last_poll < history_interval:
             return history_cache
         try:
@@ -170,6 +219,8 @@ def run_server(
     def _poll_pool():
         nonlocal pool_cache, pool_last_poll
         now = time.time()
+        if condor_backoff.fail_streak > 0:
+            return pool_cache  # scheduler failing — skip pool queries too
         if now - pool_last_poll < pool_interval:
             return pool_cache
         try:
@@ -204,6 +255,7 @@ def run_server(
                     diag_engine.tick(snap, condor_jobs, pool, logger.high_water_ts)
                 except Exception:
                     import traceback
+
                     traceback.print_exc()
 
             if snap.is_complete and not snap.is_running:
@@ -221,9 +273,12 @@ def run_server(
                         pass
                 break
 
+            # Base cadence for the local DB/loop; the condor poll itself backs
+            # off internally via the CondorBackoff gate above.
             time.sleep(poll_interval)
     except Exception as exc:
         import traceback
+
         traceback.print_exc()
         print(f"Server error: {exc}", file=sys.stderr)
     finally:

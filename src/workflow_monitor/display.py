@@ -1,4 +1,5 @@
 """Rich-based terminal dashboard for live workflow monitoring."""
+
 from __future__ import annotations
 
 import time
@@ -7,14 +8,10 @@ from pathlib import Path
 from typing import List, Optional
 
 from rich import box
-from rich.align import Align
-from rich.columns import Columns
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, TextColumn
-from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
@@ -33,6 +30,7 @@ from .diagnostics import collect_diagnostics
 from .event_log import EventLogger
 from .stats import WorkflowStats, compute_workflow_stats
 from .htcondor_poll import (
+    CondorBackoff,
     query_queue,
     query_history,
     query_slots,
@@ -50,6 +48,7 @@ from .htcondor_poll import (
 
 # ─── Workflow state styling ───────────────────────────────────────────────────
 
+
 def _wf_state_text(snap: WorkflowSnapshot) -> Text:
     if snap.is_running:
         return Text("● RUNNING", style="bold cyan")
@@ -62,6 +61,7 @@ def _wf_state_text(snap: WorkflowSnapshot) -> Text:
 
 # ─── Header panel ─────────────────────────────────────────────────────────────
 
+
 def _make_header(
     info: WorkflowInfo,
     snap: WorkflowSnapshot,
@@ -69,6 +69,7 @@ def _make_header(
     replay_info: Optional[dict] = None,
     remote_info: Optional[dict] = None,
     stall_active: bool = False,
+    condor_offline: bool = False,
 ) -> Panel:
     grid = Table.grid(expand=True, padding=(0, 0))
     grid.add_column(ratio=1)
@@ -95,6 +96,11 @@ def _make_header(
     if stall_active:
         title.append("  ")
         title.append(" STALL ", style="bold white on red")
+    if condor_offline:
+        # Scheduler is unreachable; condor-derived columns may be stale while
+        # the monitor backs off and retries. DB-driven state keeps updating.
+        title.append("  ")
+        title.append(" SCHEDD? ", style="bold black on yellow")
 
     right_col = Text(no_wrap=True)
     if replay_info is not None or remote_info is not None:
@@ -127,6 +133,7 @@ def _make_header(
 
 # ─── Status summary bar ───────────────────────────────────────────────────────
 
+
 def _make_status_bar(snap: WorkflowSnapshot) -> Panel:
     done = snap.done_count()
     total = snap.total_jobs()
@@ -136,9 +143,7 @@ def _make_status_bar(snap: WorkflowSnapshot) -> Panel:
     held = snap.held_count()
     running = snap.running_count()
     queued = snap.queued_count()
-    unsubmitted = sum(
-        1 for j in snap.jobs if j.disp_state == "UNSUBMITTED"
-    )
+    unsubmitted = sum(1 for j in snap.jobs if j.disp_state == "UNSUBMITTED")
 
     # Progress bar (manual Rich progress widget would need a separate task;
     # we render a simple bar using block characters instead)
@@ -192,6 +197,7 @@ def _make_status_bar(snap: WorkflowSnapshot) -> Panel:
 
 
 # ─── Job details table ────────────────────────────────────────────────────────
+
 
 def _activity_sort_key(job) -> tuple:
     """Stable two-tier sort key for the job table.
@@ -304,9 +310,7 @@ def _make_job_table(
                 live_parts.append(short_host)
             eff = cpu_efficiency(hist_info)
             if eff is not None:
-                eff_style = (
-                    "green" if eff >= 0.7 else "yellow" if eff >= 0.3 else "red"
-                )
+                eff_style = "green" if eff >= 0.7 else "yellow" if eff >= 0.3 else "red"
                 live_parts.append(f"cpu:{format_efficiency(eff)}")
             mem_eff = memory_efficiency(hist_info)
             if mem_eff is not None:
@@ -342,7 +346,14 @@ def _make_job_table(
     if not jobs_to_show:
         table.add_row(
             Text("(no jobs yet)", style="dim italic"),
-            "", "", "", "", "", "", "", "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
         )
 
     title = "[bold]Compute Jobs[/bold]" if not show_all else "[bold]All Jobs[/bold]"
@@ -350,6 +361,7 @@ def _make_job_table(
 
 
 # ─── Recent events panel ──────────────────────────────────────────────────────
+
 
 def _make_events_panel(snap: WorkflowSnapshot, n: int = 15) -> Panel:
     table = Table(
@@ -368,7 +380,8 @@ def _make_events_panel(snap: WorkflowSnapshot, n: int = 15) -> Panel:
 
     # Show jobs sorted by most recent activity (end_time or start_time)
     active_jobs = [
-        j for j in snap.jobs
+        j
+        for j in snap.jobs
         if j.raw_state is not None  # only jobs that have been submitted
     ]
     active_jobs.sort(
@@ -379,9 +392,7 @@ def _make_events_panel(snap: WorkflowSnapshot, n: int = 15) -> Panel:
     for job in active_jobs[:n]:
         state_style = STATE_STYLE.get(job.disp_state, "dim")
         state_cell = Text(job.disp_state, style=state_style)
-        start_cell = Text(
-            fmt_timestamp(job.start_time or job.submit_time), style="dim"
-        )
+        start_cell = Text(fmt_timestamp(job.start_time or job.submit_time), style="dim")
         end_cell = Text(
             fmt_timestamp(job.end_time) if job.end_time else "-", style="dim"
         )
@@ -400,13 +411,18 @@ def _make_events_panel(snap: WorkflowSnapshot, n: int = 15) -> Panel:
     if not active_jobs:
         table.add_row(
             Text("(no activity yet)", style="dim italic"),
-            "", "", "", "", "",
+            "",
+            "",
+            "",
+            "",
+            "",
         )
 
     return Panel(table, title="[bold]Recent Events[/bold]", padding=(0, 0))
 
 
 # ─── Infrastructure summary (compact) ────────────────────────────────────────
+
 
 def _make_infra_summary(snap: WorkflowSnapshot) -> Panel:
     infra = snap.infra_jobs()
@@ -433,6 +449,7 @@ def _make_infra_summary(snap: WorkflowSnapshot) -> Panel:
 
 
 # ─── Pool resources panel ────────────────────────────────────────────────
+
 
 def _make_pool_panel(pool: PoolSummary) -> Panel:
     table = Table(box=None, show_header=False, padding=(0, 1), expand=True)
@@ -497,6 +514,7 @@ def _make_pool_panel(pool: PoolSummary) -> Panel:
 
 # ─── Diagnostics panel ────────────────────────────────────────────────────
 
+
 def _make_diagnostics_panel(
     snap: WorkflowSnapshot,
     condor_jobs: Optional[List] = None,
@@ -535,19 +553,21 @@ def _make_diagnostics_panel(
                 reason_text.append("   ", style="dim")
                 if part.startswith("stdout:"):
                     reason_text.append("stdout: ", style="dim")
-                    msg = part[len("stdout:"):].strip()
+                    msg = part[len("stdout:") :].strip()
                     if len(msg) > 120:
                         msg = msg[:117] + "..."
                     reason_text.append(msg, style="bold white")
                 elif part.startswith("stderr:"):
                     reason_text.append("stderr: ", style="dim")
-                    msg = part[len("stderr:"):].strip()
+                    msg = part[len("stderr:") :].strip()
                     if len(msg) > 120:
                         msg = msg[:117] + "..."
                     reason_text.append(msg, style="bold yellow")
                 elif part.startswith("executable:"):
                     reason_text.append("exec:   ", style="dim")
-                    reason_text.append(part[len("executable:"):].strip(), style="dim white")
+                    reason_text.append(
+                        part[len("executable:") :].strip(), style="dim white"
+                    )
                 else:
                     reason_text.append(part, style="dim white")
                 grid.add_row(reason_text)
@@ -556,7 +576,7 @@ def _make_diagnostics_panel(
             sug_text = Text()
             if suggestion.startswith("Missing:"):
                 sug_text.append("   ✗ ", style="bold red")
-                sug_text.append(suggestion[len("Missing:"):].strip(), style="bold red")
+                sug_text.append(suggestion[len("Missing:") :].strip(), style="bold red")
             elif suggestion.startswith("Permission denied:"):
                 sug_text.append("   ✗ ", style="bold red")
                 sug_text.append(suggestion, style="bold red")
@@ -580,6 +600,7 @@ def _make_diagnostics_panel(
 
 # ─── Stall alert panel ───────────────────────────────────────────────────────
 
+
 def _make_stall_alert_panel(
     alerts: List[Dict],
     diag_path: Optional[str] = None,
@@ -600,7 +621,7 @@ def _make_stall_alert_panel(
     if stall is not None:
         stype = stall.get("stall_type", "unknown")
         details = stall.get("details", "")
-        body.append(f"Stall type: ", style="bold")
+        body.append("Stall type: ", style="bold")
         body.append(f"{stype}\n", style="bold yellow")
         if details:
             body.append(f"  {details}\n", style="white")
@@ -622,7 +643,8 @@ def _make_stall_alert_panel(
 
     # Hold/failure diagnoses (one line each, latest few)
     held_failed = [
-        a for a in alerts
+        a
+        for a in alerts
         if a.get("event_type") in ("hold_diagnosis", "failure_diagnosis")
     ]
     for d in held_failed[-3:]:
@@ -647,6 +669,7 @@ def _make_stall_alert_panel(
 
 # ─── Full layout assembly ─────────────────────────────────────────────────────
 
+
 def build_layout(
     info: WorkflowInfo,
     snap: WorkflowSnapshot,
@@ -662,6 +685,7 @@ def build_layout(
     diag_alerts: Optional[List[Dict]] = None,
     diag_path: Optional[str] = None,
     sort_by_activity: bool = True,
+    condor_offline: bool = False,
 ) -> Layout:
     has_issues = snap.held_count() > 0 or snap.failed_count() > 0
     has_alerts = bool(diag_alerts)
@@ -682,17 +706,24 @@ def build_layout(
         # 3 fixed lines + per-finding/suggestion/job lines, capped
         n_lines = 3
         idle = next(
-            (a for a in reversed(diag_alerts)
-             if a.get("event_type") == "idle_diagnosis"),
+            (
+                a
+                for a in reversed(diag_alerts)
+                if a.get("event_type") == "idle_diagnosis"
+            ),
             None,
         )
         if idle:
             n_lines += min(3, len(idle.get("findings") or []))
             n_lines += min(2, len(idle.get("suggestions") or []))
-        n_lines += min(3, sum(
-            1 for a in diag_alerts
-            if a.get("event_type") in ("hold_diagnosis", "failure_diagnosis")
-        ))
+        n_lines += min(
+            3,
+            sum(
+                1
+                for a in diag_alerts
+                if a.get("event_type") in ("hold_diagnosis", "failure_diagnosis")
+            ),
+        )
         alert_height = max(5, min(n_lines + 2, 12))
         parts.append(Layout(name="stall_alert", size=alert_height))
     if has_issues:
@@ -721,23 +752,44 @@ def build_layout(
         )
         layout["infra"].update(_make_infra_summary(snap))
 
-    layout["header"].update(_make_header(
-        info, snap, refresh_ts,
-        replay_info=replay_info, remote_info=remote_info,
-        stall_active=has_alerts,
-    ))
+    layout["header"].update(
+        _make_header(
+            info,
+            snap,
+            refresh_ts,
+            replay_info=replay_info,
+            remote_info=remote_info,
+            stall_active=has_alerts,
+            condor_offline=condor_offline,
+        )
+    )
     layout["status"].update(_make_status_bar(snap))
     if has_alerts:
-        layout["stall_alert"].update(_make_stall_alert_panel(diag_alerts, diag_path=diag_path))
+        layout["stall_alert"].update(
+            _make_stall_alert_panel(diag_alerts, diag_path=diag_path)
+        )
     if has_issues:
-        layout["diagnostics"].update(_make_diagnostics_panel(snap, condor_jobs=condor_jobs, submit_dir=submit_dir))
-    layout["jobs"].update(_make_job_table(snap, show_all=show_all, condor_jobs=condor_jobs, condor_history=condor_history, sort_by_activity=sort_by_activity))
+        layout["diagnostics"].update(
+            _make_diagnostics_panel(
+                snap, condor_jobs=condor_jobs, submit_dir=submit_dir
+            )
+        )
+    layout["jobs"].update(
+        _make_job_table(
+            snap,
+            show_all=show_all,
+            condor_jobs=condor_jobs,
+            condor_history=condor_history,
+            sort_by_activity=sort_by_activity,
+        )
+    )
     layout["events"].update(_make_events_panel(snap, n=events_n))
 
     return layout
 
 
 # ─── Monitor loop ─────────────────────────────────────────────────────────────
+
 
 def run_monitor(
     info: WorkflowInfo,
@@ -751,6 +803,8 @@ def run_monitor(
     log_path: Optional[Path] = None,
     diagnose: bool = False,
     sort_by_activity: bool = True,
+    min_free_mb: float = 200.0,
+    max_log_mb: Optional[float] = None,
 ) -> None:
     """Run the live terminal dashboard.
 
@@ -765,6 +819,8 @@ def run_monitor(
     condor_kwargs:     Extra kwargs forwarded to htcondor_poll.query_queue().
     once:              Print status once and exit (non-interactive).
     log_path:          If set, write JSONL event log to this path.
+    min_free_mb:       Pause event logging below this much free space (MB).
+    max_log_mb:        Optional hard cap on the JSONL size (MB); None = unbounded.
     """
     ck = condor_kwargs or {}
 
@@ -772,7 +828,9 @@ def run_monitor(
 
     logger: Optional[EventLogger] = None
     if log_path is not None:
-        logger = EventLogger(info, db, log_path=log_path)
+        logger = EventLogger(
+            info, db, log_path=log_path, min_free_mb=min_free_mb, max_log_mb=max_log_mb
+        )
         if logger.resumed:
             console.print(f"[dim]Resuming event log at {logger.path}[/dim]")
         else:
@@ -797,11 +855,27 @@ def run_monitor(
         )
         console.print(f"[dim]Diagnostics sidecar: {diag_path}[/dim]")
 
+    # Adaptive gate: the TUI keeps refreshing local DB state every cycle, but
+    # the live condor queue is polled less often when the scheduler is failing
+    # so a struggling schedd is never hammered and the UI never freezes. The
+    # last good queue is reused while gated/failed (no stderr output here — it
+    # would corrupt the full-screen Live; the state is shown via a header badge).
+    condor_backoff = CondorBackoff(poll_interval)
+    _last_condor_jobs: List = []
+
     def _poll_condor() -> List:
+        nonlocal _last_condor_jobs
+        now = time.time()
+        if not condor_backoff.due(now):
+            return _last_condor_jobs
         try:
-            return query_queue(constraint=condor_constraint, **ck)
+            jobs = query_queue(constraint=condor_constraint, raise_on_error=True, **ck)
         except Exception:
-            return []
+            condor_backoff.record(False, now)
+            return _last_condor_jobs
+        condor_backoff.record(True, now)
+        _last_condor_jobs = jobs
+        return jobs
 
     # History cache: accumulates completed job records, refreshed every
     # few poll cycles to avoid hammering condor_history each second.
@@ -812,6 +886,9 @@ def run_monitor(
     def _poll_history() -> List:
         nonlocal _history_cache, _history_last_poll
         now = time.time()
+        # While the scheduler is failing, skip history too (don't add load).
+        if condor_backoff.fail_streak > 0:
+            return _history_cache
         if now - _history_last_poll < _HISTORY_INTERVAL:
             return _history_cache
         try:
@@ -837,6 +914,8 @@ def run_monitor(
     def _poll_pool() -> Optional[PoolSummary]:
         nonlocal _pool_cache, _pool_last_poll
         now = time.time()
+        if condor_backoff.fail_streak > 0:
+            return _pool_cache  # scheduler failing — skip pool queries too
         if now - _pool_last_poll < _POOL_INTERVAL:
             return _pool_cache
         try:
@@ -875,8 +954,10 @@ def run_monitor(
                     if et == "stall_resolved":
                         diag_active_alerts.clear()
                     elif et in (
-                        "stall_detected", "idle_diagnosis",
-                        "hold_diagnosis", "failure_diagnosis",
+                        "stall_detected",
+                        "idle_diagnosis",
+                        "hold_diagnosis",
+                        "failure_diagnosis",
                     ):
                         diag_active_alerts.append(ev)
             except Exception:
@@ -888,15 +969,35 @@ def run_monitor(
         console.print(_make_header(info, snap, ts))
         console.print(_make_status_bar(snap))
         if snap.held_count() > 0 or snap.failed_count() > 0:
-            console.print(_make_diagnostics_panel(snap, condor_jobs=condor_jobs, submit_dir=info.submit_dir))
-        console.print(_make_job_table(snap, show_all=show_all, condor_jobs=condor_jobs, condor_history=history, sort_by_activity=sort_by_activity))
+            console.print(
+                _make_diagnostics_panel(
+                    snap, condor_jobs=condor_jobs, submit_dir=info.submit_dir
+                )
+            )
+        console.print(
+            _make_job_table(
+                snap,
+                show_all=show_all,
+                condor_jobs=condor_jobs,
+                condor_history=history,
+                sort_by_activity=sort_by_activity,
+            )
+        )
         if snap.infra_jobs():
             console.print(_make_infra_summary(snap))
         if pool is not None:
             console.print(_make_pool_panel(pool))
         console.print(_make_events_panel(snap, n=events_n))
-        wf_stats = compute_workflow_stats(snap, condor_history=history, pool_status=pool)
-        _print_final_summary(console, snap, condor_jobs=condor_jobs, submit_dir=info.submit_dir, stats=wf_stats)
+        wf_stats = compute_workflow_stats(
+            snap, condor_history=history, pool_status=pool
+        )
+        _print_final_summary(
+            console,
+            snap,
+            condor_jobs=condor_jobs,
+            submit_dir=info.submit_dir,
+            stats=wf_stats,
+        )
         if logger is not None:
             logger.close(snap, condor_history=history, pool_status=pool)
         if diag_engine is not None:
@@ -916,13 +1017,21 @@ def run_monitor(
             while True:
                 snap, condor_jobs, history, pool, ts = _refresh()
                 layout = build_layout(
-                    info, snap, show_all, condor_jobs, events_n, ts,
+                    info,
+                    snap,
+                    show_all,
+                    condor_jobs,
+                    events_n,
+                    ts,
                     submit_dir=info.submit_dir,
                     condor_history=history,
                     pool_status=pool,
-                    diag_alerts=list(diag_active_alerts) if diag_active_alerts else None,
+                    diag_alerts=list(diag_active_alerts)
+                    if diag_active_alerts
+                    else None,
                     diag_path=str(diag_engine.path) if diag_engine else None,
                     sort_by_activity=sort_by_activity,
+                    condor_offline=condor_backoff.fail_streak > 0,
                 )
                 live.update(layout)
 
@@ -931,13 +1040,23 @@ def run_monitor(
                     time.sleep(poll_interval)
                     snap, condor_jobs, history, pool, ts = _refresh()
                     live.update(
-                        build_layout(info, snap, show_all, condor_jobs, events_n, ts,
-                                     submit_dir=info.submit_dir,
-                                     condor_history=history,
-                                     pool_status=pool,
-                                     diag_alerts=list(diag_active_alerts) if diag_active_alerts else None,
-                                     diag_path=str(diag_engine.path) if diag_engine else None,
-                                     sort_by_activity=sort_by_activity)
+                        build_layout(
+                            info,
+                            snap,
+                            show_all,
+                            condor_jobs,
+                            events_n,
+                            ts,
+                            submit_dir=info.submit_dir,
+                            condor_history=history,
+                            pool_status=pool,
+                            diag_alerts=list(diag_active_alerts)
+                            if diag_active_alerts
+                            else None,
+                            diag_path=str(diag_engine.path) if diag_engine else None,
+                            sort_by_activity=sort_by_activity,
+                            condor_offline=condor_backoff.fail_streak > 0,
+                        )
                     )
                     break
 
@@ -948,7 +1067,13 @@ def run_monitor(
 
     # After live session ends, print a brief final summary
     wf_stats = compute_workflow_stats(snap, condor_history=history, pool_status=pool)
-    _print_final_summary(console, snap, condor_jobs=condor_jobs, submit_dir=info.submit_dir, stats=wf_stats)
+    _print_final_summary(
+        console,
+        snap,
+        condor_jobs=condor_jobs,
+        submit_dir=info.submit_dir,
+        stats=wf_stats,
+    )
     if logger is not None:
         logger.close(snap, condor_history=history, pool_status=pool)
     if diag_engine is not None:
@@ -958,7 +1083,9 @@ def run_monitor(
             pass
 
 
-def _format_eff_range(lo: Optional[float], hi: Optional[float], mean: Optional[float]) -> str:
+def _format_eff_range(
+    lo: Optional[float], hi: Optional[float], mean: Optional[float]
+) -> str:
     """Format an efficiency range like '81% (42%–98%)'."""
     if mean is None:
         return ""
@@ -1008,7 +1135,9 @@ def _print_stats_block(console: Console, stats: WorkflowStats) -> None:
 
     # Duration range
     if stats.dur_min is not None and stats.dur_max is not None:
-        dur_line = f"min: {fmt_duration(stats.dur_min)}  max: {fmt_duration(stats.dur_max)}"
+        dur_line = (
+            f"min: {fmt_duration(stats.dur_min)}  max: {fmt_duration(stats.dur_max)}"
+        )
         if stats.dur_mean is not None:
             dur_line += f"  mean: {fmt_duration(stats.dur_mean)}"
         if stats.dur_median is not None:
@@ -1017,10 +1146,17 @@ def _print_stats_block(console: Console, stats: WorkflowStats) -> None:
 
     # Longest / shortest job
     if stats.longest_job_name and stats.dur_max is not None:
-        table.add_row("Longest job", f"{stats.longest_job_name} ({fmt_duration(stats.dur_max)})")
-    if (stats.shortest_job_name and stats.dur_min is not None
-            and stats.shortest_job_name != stats.longest_job_name):
-        table.add_row("Shortest job", f"{stats.shortest_job_name} ({fmt_duration(stats.dur_min)})")
+        table.add_row(
+            "Longest job", f"{stats.longest_job_name} ({fmt_duration(stats.dur_max)})"
+        )
+    if (
+        stats.shortest_job_name
+        and stats.dur_min is not None
+        and stats.shortest_job_name != stats.longest_job_name
+    ):
+        table.add_row(
+            "Shortest job", f"{stats.shortest_job_name} ({fmt_duration(stats.dur_min)})"
+        )
 
     # Memory
     if stats.peak_maxrss_kb is not None:
@@ -1032,12 +1168,16 @@ def _print_stats_block(console: Console, stats: WorkflowStats) -> None:
         table.add_row("Memory", mem_line)
 
     # CPU efficiency
-    eff_line = _format_eff_range(stats.cpu_eff_min, stats.cpu_eff_max, stats.cpu_eff_mean)
+    eff_line = _format_eff_range(
+        stats.cpu_eff_min, stats.cpu_eff_max, stats.cpu_eff_mean
+    )
     if eff_line:
         table.add_row("CPU efficiency", eff_line)
 
     # Memory efficiency
-    mem_eff_line = _format_eff_range(stats.mem_eff_min, stats.mem_eff_max, stats.mem_eff_mean)
+    mem_eff_line = _format_eff_range(
+        stats.mem_eff_min, stats.mem_eff_max, stats.mem_eff_mean
+    )
     if mem_eff_line:
         table.add_row("Mem efficiency", mem_eff_line)
 
@@ -1045,7 +1185,9 @@ def _print_stats_block(console: Console, stats: WorkflowStats) -> None:
     if stats.wait_mean is not None:
         wait_line = f"mean: {fmt_duration(stats.wait_mean)}"
         if stats.wait_min is not None and stats.wait_max is not None:
-            wait_line += f"  ({fmt_duration(stats.wait_min)}–{fmt_duration(stats.wait_max)})"
+            wait_line += (
+                f"  ({fmt_duration(stats.wait_min)}–{fmt_duration(stats.wait_max)})"
+            )
         table.add_row("Queue wait", wait_line)
 
     # CPU-hours
@@ -1059,9 +1201,11 @@ def _print_stats_block(console: Console, stats: WorkflowStats) -> None:
     # Transfer
     if stats.transfer_bytes is not None and stats.transfer_bytes > 0:
         from .htcondor_poll import format_transfer
-        table.add_row("Data transfer", format_transfer(
-            {"BytesSent": stats.transfer_bytes, "BytesRecvd": 0}
-        ))
+
+        table.add_row(
+            "Data transfer",
+            format_transfer({"BytesSent": stats.transfer_bytes, "BytesRecvd": 0}),
+        )
 
     # Retries
     if stats.retry_count is not None and stats.retry_count > 0:
@@ -1109,11 +1253,15 @@ def _print_final_summary(
         held = snap.held_jobs()
         failed = snap.failed_jobs()
         if held or failed:
-            diags = collect_diagnostics(held, failed, condor_jobs, submit_dir=submit_dir)
+            diags = collect_diagnostics(
+                held, failed, condor_jobs, submit_dir=submit_dir
+            )
             for diag in diags:
                 icon = "⊘" if diag.severity == "held" else "✖"
                 style = "magenta" if diag.severity == "held" else "red"
-                console.print(f"  [{style}]{icon} {diag.job_name}[/{style}]: {diag.summary}")
+                console.print(
+                    f"  [{style}]{icon} {diag.job_name}[/{style}]: {diag.summary}"
+                )
                 has_structured = any(
                     s.startswith("Missing:") or s.startswith("Permission denied:")
                     for s in diag.suggestions
@@ -1123,7 +1271,9 @@ def _print_final_summary(
                         if has_structured and part.startswith("stderr:"):
                             continue
                         if part.startswith("stdout:"):
-                            console.print(f"    [white]stdout: {part[7:].strip()}[/white]")
+                            console.print(
+                                f"    [white]stdout: {part[7:].strip()}[/white]"
+                            )
                         elif part.startswith("stderr:"):
                             msg = part[7:].strip()
                             if len(msg) > 200:
@@ -1148,7 +1298,9 @@ def _print_final_summary(
         msg += ")"
         console.print(msg)
         if held:
-            diags = collect_diagnostics(snap.held_jobs(), [], condor_jobs, submit_dir=submit_dir)
+            diags = collect_diagnostics(
+                snap.held_jobs(), [], condor_jobs, submit_dir=submit_dir
+            )
             for diag in diags:
                 console.print(f"  [magenta]⊘ {diag.job_name}[/magenta]: {diag.summary}")
                 for sug in diag.suggestions[:2]:
