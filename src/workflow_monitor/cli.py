@@ -1,4 +1,5 @@
 """Command-line entry point for workflow-monitor."""
+
 from __future__ import annotations
 
 import argparse
@@ -40,19 +41,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workflow submit dir, base dir, or braindump.yml (default: cwd)",
     )
     p.add_argument(
-        "--version", "-V",
+        "--version",
+        "-V",
         action="version",
         version=f"workflow-monitor {__version__}",
     )
     p.add_argument(
-        "--interval", "-i",
+        "--interval",
+        "-i",
         type=float,
         default=2.0,
         metavar="SECONDS",
         help="Refresh interval in seconds (default: 2.0)",
     )
     p.add_argument(
-        "--all-jobs", "-a",
+        "--all-jobs",
+        "-a",
         action="store_true",
         default=False,
         help="Show all job types, not just compute jobs",
@@ -62,11 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Order the job table by most recent activity, with RUNNING jobs "
-             "always at the top (default: enabled). Use --no-sort-by-activity "
-             "to keep the original DAG/submit order.",
+        "always at the top (default: enabled). Use --no-sort-by-activity "
+        "to keep the original DAG/submit order.",
     )
     p.add_argument(
-        "--events", "-e",
+        "--events",
+        "-e",
         type=int,
         default=15,
         metavar="N",
@@ -89,17 +94,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "always", "never"),
         default="auto",
         help="How to interpret submit_dir from braindump.yml: "
-             "'auto' (default) rebases onto the braindump.yml's parent "
-             "directory only when the recorded path doesn't exist locally; "
-             "'always' forces rebasing (use for container-planned workflows "
-             "viewed from the host); 'never' trusts the recorded path verbatim.",
+        "'auto' (default) rebases onto the braindump.yml's parent "
+        "directory only when the recorded path doesn't exist locally; "
+        "'always' forces rebasing (use for container-planned workflows "
+        "viewed from the host); 'never' trusts the recorded path verbatim.",
     )
     p.add_argument(
         "--diagnose",
         action="store_true",
         default=False,
         help="Enable the diagnostics layer (stall detection + auto-diagnosis, "
-             "writes a diagnostics-events.jsonl sidecar file)",
+        "writes a diagnostics-events.jsonl sidecar file)",
     )
     p.add_argument(
         "--log",
@@ -121,6 +126,31 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.0,
         metavar="MULTIPLIER",
         help="Replay speed multiplier (default: 1.0, e.g. 4 = 4x speed)",
+    )
+
+    # ── Logging safeguards ───────────────────────────────────────────────────
+    guard = p.add_argument_group(
+        "Logging safeguards",
+        "Bound the JSONL event log's footprint so the monitor never fills the "
+        "filesystem the workflow runs on. Applies whenever an event log is "
+        "written (--log or --serve).",
+    )
+    guard.add_argument(
+        "--min-free-mb",
+        type=float,
+        default=200.0,
+        metavar="MB",
+        help="Pause event logging when free space on the log's filesystem "
+        "drops below this many MB; resume when it recovers "
+        "(default: 200; 0 to disable).",
+    )
+    guard.add_argument(
+        "--max-log-mb",
+        type=float,
+        default=None,
+        metavar="MB",
+        help="Pause event logging when the JSONL file grows past this many MB "
+        "(default: unlimited).",
     )
 
     # ── Client/Server mode ───────────────────────────────────────────────────
@@ -253,7 +283,11 @@ def main(argv: list | None = None) -> int:
                 ssh_config=args.ssh_config,
                 ssh_identity=args.ssh_identity,
             )
-            engine.run(show_all=args.all_jobs, once=args.once, sort_by_activity=args.sort_by_activity)
+            engine.run(
+                show_all=args.all_jobs,
+                once=args.once,
+                sort_by_activity=args.sort_by_activity,
+            )
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"[error] {exc}", file=sys.stderr)
             return 1
@@ -271,7 +305,7 @@ def main(argv: list | None = None) -> int:
             except FileNotFoundError as exc:
                 print(f"[error] {exc}", file=sys.stderr)
                 return 1
-            pid_file = (info.submit_dir / "workflow-events.pid")
+            pid_file = info.submit_dir / "workflow-events.pid"
         else:
             pid_file = Path(args.stop_server)
 
@@ -279,7 +313,9 @@ def main(argv: list | None = None) -> int:
             print(f"Server stopped (PID file: {pid_file})")
             return 0
         else:
-            print(f"[error] Could not stop server (PID file: {pid_file})", file=sys.stderr)
+            print(
+                f"[error] Could not stop server (PID file: {pid_file})", file=sys.stderr
+            )
             return 1
 
     target = Path(args.target)
@@ -340,7 +376,7 @@ def main(argv: list | None = None) -> int:
         recorded_submit_str = str(info.recorded_submit_dir)
         submit_dir_esc = recorded_submit_str.replace("\\", "\\\\").replace('"', '\\"')
         condor_constraint_idle = (
-            f'Cmd =!= UNDEFINED'
+            f"Cmd =!= UNDEFINED"
             f' && substr(Cmd, 0, {len(recorded_submit_str)}) == "{submit_dir_esc}"'
         )
 
@@ -371,7 +407,7 @@ def main(argv: list | None = None) -> int:
     recorded_submit_str = str(info.recorded_submit_dir)
     submit_dir_esc = recorded_submit_str.replace("\\", "\\\\").replace('"', '\\"')
     condor_constraint = (
-        f'Cmd =!= UNDEFINED'
+        f"Cmd =!= UNDEFINED"
         f' && substr(Cmd, 0, {len(recorded_submit_str)}) == "{submit_dir_esc}"'
     )
 
@@ -389,6 +425,8 @@ def main(argv: list | None = None) -> int:
                 condor_constraint=condor_constraint,
                 foreground=args.serve_foreground,
                 diagnose=args.diagnose,
+                min_free_mb=args.min_free_mb,
+                max_log_mb=args.max_log_mb,
             )
         return 0
 
@@ -406,6 +444,8 @@ def main(argv: list | None = None) -> int:
             log_path=log_path,
             diagnose=args.diagnose,
             sort_by_activity=args.sort_by_activity,
+            min_free_mb=args.min_free_mb,
+            max_log_mb=args.max_log_mb,
         )
 
     return 0

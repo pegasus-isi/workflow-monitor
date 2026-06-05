@@ -847,6 +847,48 @@ Output `Diagnostic` dataclass: `job_name`, `severity` ("held"/"failed"/"warning"
 }
 ```
 
+#### `log_paused` / `log_resumed` — Disk-exhaustion guard control events
+
+These are **control events about the log itself**, not workflow facts. The event
+log is append-only and, by default, lives on the same filesystem as the
+workflow's submit directory. To guarantee the monitor can never fill that
+filesystem out from under `pegasus-monitord` or HTCondor, `EventLogger` watches
+free space (floor: `--min-free-mb`, default 200 MB) and an optional size cap
+(`--max-log-mb`, default unlimited). When either threshold is crossed it stops
+appending and writes a `log_paused` marker; when free space recovers (with 1.5×
+hysteresis) it writes `log_resumed` and continues. Events produced while paused
+are **dropped**, not buffered.
+
+```json
+{
+  "event_type": "log_paused",
+  "timestamp": 1719500050.0,
+  "wf_uuid": "abc-123-def",
+  "reason": "free space 150 MB below floor 200 MB",
+  "free_mb": 150.0,
+  "log_mb": 4096.0
+}
+```
+
+```json
+{
+  "event_type": "log_resumed",
+  "timestamp": 1719500200.0,
+  "wf_uuid": "abc-123-def",
+  "free_mb": 512.0,
+  "log_mb": 4096.0,
+  "dropped": 87
+}
+```
+
+**Trigger:** free space `<` `min_free_mb`, or log size `>` `max_log_mb` (when set);
+checked at most once per 5 s. A write that fails with `OSError` (disk filled
+between checks) also forces a pause.
+**Disable:** `--min-free-mb 0` with no `--max-log-mb` turns the guard off entirely.
+**Consumer note:** replay/remote clients may ignore these; they carry no job or
+workflow state. A `dropped > 0` on `log_resumed` signals a gap in the series.
+**Data sources:** `shutil.disk_usage()` on the log's filesystem; the log file's own size.
+
 ### Resume Logic
 
 The `EventLogger` supports stop/restart continuity:

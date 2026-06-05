@@ -1,7 +1,10 @@
 """JSONL event logger for workflow replay."""
+
 from __future__ import annotations
 
 import json
+import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -29,6 +32,8 @@ class EventLogger:
         info: WorkflowInfo,
         db: StampedeDB,
         log_path: Optional[Path] = None,
+        min_free_mb: float = 200.0,
+        max_log_mb: Optional[float] = None,
     ) -> None:
         self._info = info
         self._db = db
@@ -37,6 +42,21 @@ class EventLogger:
         if log_path is None:
             log_path = info.submit_dir / "workflow-events.jsonl"
         self._path = log_path
+
+        # ── Disk-exhaustion guard ────────────────────────────────────────────
+        # The event log is append-only and unbounded, and by default lives on
+        # the same filesystem as the workflow's submit dir.  To guarantee the
+        # monitor can never fill that filesystem out from under pegasus-monitord
+        # or HTCondor, appending pauses when free space drops below a floor (or
+        # an optional size cap is exceeded) and resumes if space recovers.
+        self._min_free_bytes: int = int(max(min_free_mb, 0.0) * 1024 * 1024)
+        self._max_log_bytes: Optional[int] = (
+            int(max_log_mb * 1024 * 1024) if max_log_mb and max_log_mb > 0 else None
+        )
+        self._paused: bool = False
+        self._dropped_events: int = 0
+        self._disk_last_check: float = 0.0
+        self._disk_check_interval: float = 5.0
 
         self._high_water_ts: float = 0.0
         self._last_wf_state: Optional[str] = None
@@ -103,7 +123,9 @@ class EventLogger:
                         self._last_history_fingerprint = self._history_fingerprint(jobs)
 
                     elif etype == "pool_status":
-                        self._last_pool_fingerprint = self._pool_fingerprint(ev.get("pool", {}))
+                        self._last_pool_fingerprint = self._pool_fingerprint(
+                            ev.get("pool", {})
+                        )
 
                     elif etype == "workflow_end":
                         last_end_offset = offset
@@ -132,22 +154,143 @@ class EventLogger:
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
-    def _emit(self, event: Dict[str, Any]) -> None:
+    def _write_raw(self, event: Dict[str, Any]) -> None:
+        """Serialize and append one event, bypassing the disk-exhaustion guard.
+
+        Used both by ``_emit`` (after the guard approves) and by the guard
+        itself to write its own ``log_paused``/``log_resumed`` control markers.
+        """
         event.setdefault("wf_uuid", self._wf_uuid)
         self._fh.write(json.dumps(event, default=str) + "\n")
         self._fh.flush()
 
+    def _emit(self, event: Dict[str, Any]) -> None:
+        if not self._disk_ok():
+            self._dropped_events += 1
+            return
+        try:
+            self._write_raw(event)
+        except OSError as exc:
+            # Filesystem filled between periodic checks — stop writing now so we
+            # never contribute to exhausting the volume the workflow runs on.
+            self._force_pause(f"write failed: {exc}")
+            self._dropped_events += 1
+
+    # ── Disk-exhaustion guard ─────────────────────────────────────────────────
+
+    def _disk_ok(self) -> bool:
+        """Return True if it is safe to append another event.
+
+        Pauses logging when free space on the log's filesystem drops below the
+        configured floor, or when an optional size cap is exceeded; resumes once
+        free space recovers (with 1.5x hysteresis to avoid flapping).  The
+        underlying ``statvfs`` is throttled to once per ``_disk_check_interval``
+        seconds so the guard adds negligible overhead at the normal poll cadence.
+        """
+        if self._min_free_bytes <= 0 and self._max_log_bytes is None:
+            return True  # guard fully disabled
+
+        now = time.time()
+        if now - self._disk_last_check < self._disk_check_interval:
+            return not self._paused
+        self._disk_last_check = now
+
+        try:
+            free = shutil.disk_usage(self._path.parent).free
+        except OSError:
+            return not self._paused  # can't stat — leave state unchanged
+        size = 0
+        if self._max_log_bytes is not None:
+            try:
+                size = self._path.stat().st_size
+            except OSError:
+                size = 0
+
+        low_space = self._min_free_bytes > 0 and free < self._min_free_bytes
+        too_big = self._max_log_bytes is not None and size > self._max_log_bytes
+
+        if not self._paused and (low_space or too_big):
+            if low_space:
+                reason = (
+                    f"free space {free // (1024 * 1024)} MB below floor "
+                    f"{self._min_free_bytes // (1024 * 1024)} MB"
+                )
+            else:
+                reason = (
+                    f"log size {size // (1024 * 1024)} MB exceeds cap "
+                    f"{self._max_log_bytes // (1024 * 1024)} MB"
+                )
+            self._force_pause(reason, free=free, size=size)
+        elif self._paused:
+            # Resume only with real headroom (1.5x the floor) and under the cap.
+            recovered_space = (
+                self._min_free_bytes <= 0 or free > self._min_free_bytes * 1.5
+            )
+            under_cap = self._max_log_bytes is None or size <= self._max_log_bytes
+            if recovered_space and under_cap:
+                self._resume(free=free, size=size)
+
+        return not self._paused
+
+    def _force_pause(self, reason: str, free: int = 0, size: int = 0) -> None:
+        """Enter the paused state and write a best-effort ``log_paused`` marker."""
+        if self._paused:
+            return
+        self._paused = True
+        print(
+            f"[disk-guard] pausing event log — {reason}; further events dropped "
+            f"until space recovers",
+            file=sys.stderr,
+        )
+        try:
+            self._write_raw(
+                {
+                    "event_type": "log_paused",
+                    "timestamp": time.time(),
+                    "reason": reason,
+                    "free_mb": round(free / (1024 * 1024), 1),
+                    "log_mb": round(size / (1024 * 1024), 1),
+                }
+            )
+        except OSError:
+            pass  # disk truly full — nothing more we can do
+
+    def _resume(self, free: int = 0, size: int = 0) -> None:
+        """Leave the paused state and write a ``log_resumed`` marker."""
+        dropped = self._dropped_events
+        try:
+            self._write_raw(
+                {
+                    "event_type": "log_resumed",
+                    "timestamp": time.time(),
+                    "free_mb": round(free / (1024 * 1024), 1),
+                    "log_mb": round(size / (1024 * 1024), 1),
+                    "dropped": dropped,
+                }
+            )
+        except OSError:
+            return  # couldn't even write the resume marker — stay paused
+        self._paused = False
+        self._dropped_events = 0
+        print(
+            f"[disk-guard] resuming event log — free space recovered "
+            f"({free // (1024 * 1024)} MB); {dropped} event(s) dropped while paused",
+            file=sys.stderr,
+        )
+
     def _write_header(self) -> None:
         wf_times = self._db.get_workflow_times()
-        self._emit({
-            "event_type": "workflow_start",
-            "timestamp": time.time(),
-            "dax_label": self._info.dax_label,
-            "user": self._info.user,
-            "planner_version": self._info.planner_version,
-            "submit_dir": str(self._info.submit_dir),
-            "wf_start": wf_times.get("start"),
-        })
+        self._emit(
+            {
+                "event_type": "workflow_start",
+                "timestamp": time.time(),
+                "dax_label": self._info.dax_label,
+                "user": self._info.user,
+                "planner_version": self._info.planner_version,
+                "submit_dir": str(self._info.submit_dir),
+                "wf_start": wf_times.get("start"),
+            }
+        )
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -178,11 +321,13 @@ class EventLogger:
         # Emit analytics summary before the end marker
         if snapshot is not None:
             wf_stats = compute_workflow_stats(snapshot, condor_history, pool_status)
-            self._emit({
-                "event_type": "workflow_stats",
-                "timestamp": time.time(),
-                "stats": wf_stats.to_dict(),
-            })
+            self._emit(
+                {
+                    "event_type": "workflow_stats",
+                    "timestamp": time.time(),
+                    "stats": wf_stats.to_dict(),
+                }
+            )
 
         end_event: Dict[str, Any] = {
             "event_type": "workflow_end",
@@ -197,7 +342,10 @@ class EventLogger:
             end_event["failed"] = snapshot.failed_count()
             end_event["elapsed"] = snapshot.elapsed
         self._emit(end_event)
-        self._fh.close()
+        try:
+            self._fh.close()
+        except OSError:
+            pass  # closing flushes buffered data; ignore a full-disk failure
 
     @property
     def path(self) -> Path:
@@ -228,12 +376,14 @@ class EventLogger:
             if j.task_argv:
                 entry["task_argv"] = j.task_argv
             jobs.append(entry)
-        self._emit({
-            "event_type": "jobs_init",
-            "timestamp": time.time(),
-            "total_jobs": len(jobs),
-            "jobs": jobs,
-        })
+        self._emit(
+            {
+                "event_type": "jobs_init",
+                "timestamp": time.time(),
+                "total_jobs": len(jobs),
+                "jobs": jobs,
+            }
+        )
 
     def _record_workflow_state(self, snapshot: WorkflowSnapshot) -> None:
         if snapshot.wf_state != self._last_wf_state:
@@ -298,11 +448,13 @@ class EventLogger:
             return
         fp = self._condor_fingerprint(condor_jobs)
         if fp != self._last_condor_fingerprint:
-            self._emit({
-                "event_type": "htcondor_poll",
-                "timestamp": time.time(),
-                "jobs": condor_jobs,
-            })
+            self._emit(
+                {
+                    "event_type": "htcondor_poll",
+                    "timestamp": time.time(),
+                    "jobs": condor_jobs,
+                }
+            )
             self._last_condor_fingerprint = fp
 
     @staticmethod
@@ -319,11 +471,13 @@ class EventLogger:
             return
         fp = self._history_fingerprint(condor_history)
         if fp != self._last_history_fingerprint:
-            self._emit({
-                "event_type": "htcondor_history",
-                "timestamp": time.time(),
-                "jobs": condor_history,
-            })
+            self._emit(
+                {
+                    "event_type": "htcondor_history",
+                    "timestamp": time.time(),
+                    "jobs": condor_history,
+                }
+            )
             self._last_history_fingerprint = fp
 
     @staticmethod
@@ -343,9 +497,11 @@ class EventLogger:
         pool_dict = pool.to_dict()
         fp = self._pool_fingerprint(pool_dict)
         if fp != self._last_pool_fingerprint:
-            self._emit({
-                "event_type": "pool_status",
-                "timestamp": time.time(),
-                "pool": pool_dict,
-            })
+            self._emit(
+                {
+                    "event_type": "pool_status",
+                    "timestamp": time.time(),
+                    "pool": pool_dict,
+                }
+            )
             self._last_pool_fingerprint = fp

@@ -17,6 +17,7 @@ Supported mechanisms (in priority order):
 If no credentials are needed (local pool with ALLOW_READ = *), nothing
 special is required.
 """
+
 from __future__ import annotations
 
 import json
@@ -37,7 +38,19 @@ JOB_STATUS: Dict[int, str] = {
 }
 
 
+class CondorQueryError(RuntimeError):
+    """A HTCondor query could not reach or parse the scheduler.
+
+    Only raised when a caller passes ``raise_on_error=True`` (e.g. the server's
+    poll loop, which uses it to drive adaptive back-off).  The default contract
+    of the public query functions is unchanged: errors are swallowed and an
+    empty result is returned.  Note that an *empty but valid* result (no jobs
+    matched) is **not** an error and never raises.
+    """
+
+
 # ─── Python bindings (preferred) ─────────────────────────────────────────────
+
 
 def _try_python_bindings(
     constraint: Optional[str] = None,
@@ -54,6 +67,7 @@ def _try_python_bindings(
     for mod_name in ("htcondor", "htcondor2"):
         try:
             import importlib
+
             ht = importlib.import_module(mod_name)
         except ImportError:
             continue
@@ -74,17 +88,29 @@ def _try_python_bindings(
 
             projection = [
                 # Identity & status
-                "ClusterId", "ProcId", "JobStatus",
-                "Cmd", "RemoteHost", "QDate", "JobStartDate",
-                "DAGNodeName", "Owner",
-                "HoldReason", "HoldReasonCode",
+                "ClusterId",
+                "ProcId",
+                "JobStatus",
+                "Cmd",
+                "RemoteHost",
+                "QDate",
+                "JobStartDate",
+                "DAGNodeName",
+                "Owner",
+                "HoldReason",
+                "HoldReasonCode",
                 # Resource requests (Tier 1)
-                "RequestCpus", "RequestMemory", "RequestDisk",
+                "RequestCpus",
+                "RequestMemory",
+                "RequestDisk",
                 "RequestGpus",
-                "ImageSize", "NumJobStarts", "AccountingGroup",
+                "ImageSize",
+                "NumJobStarts",
+                "AccountingGroup",
                 # File transfer & I/O (Tier 2)
                 "TransferInputSizeMB",
-                "BytesSent", "BytesRecvd",
+                "BytesSent",
+                "BytesRecvd",
             ]
             q_args: Dict[str, Any] = {"projection": projection}
             if constraint:
@@ -101,23 +127,42 @@ def _try_python_bindings(
 # ─── subprocess fallback ──────────────────────────────────────────────────────
 
 _SUBPROCESS_ATTRS = [
-    "ClusterId", "ProcId", "JobStatus",
-    "Cmd", "RemoteHost", "QDate", "JobStartDate",
-    "DAGNodeName", "Owner",
-    "HoldReason", "HoldReasonCode",
-    "RequestCpus", "RequestMemory", "RequestDisk",
+    "ClusterId",
+    "ProcId",
+    "JobStatus",
+    "Cmd",
+    "RemoteHost",
+    "QDate",
+    "JobStartDate",
+    "DAGNodeName",
+    "Owner",
+    "HoldReason",
+    "HoldReasonCode",
+    "RequestCpus",
+    "RequestMemory",
+    "RequestDisk",
     "RequestGpus",
-    "ImageSize", "NumJobStarts", "AccountingGroup",
+    "ImageSize",
+    "NumJobStarts",
+    "AccountingGroup",
     "TransferInputSizeMB",
-    "BytesSent", "BytesRecvd",
+    "BytesSent",
+    "BytesRecvd",
 ]
 
 
 def _query_via_subprocess(
     constraint: Optional[str] = None,
     schedd_name: Optional[str] = None,
+    raise_on_error: bool = False,
 ) -> List[Dict]:
-    """Query HTCondor queue via ``condor_q -json``."""
+    """Query HTCondor queue via ``condor_q -json``.
+
+    With ``raise_on_error=True``, a *hard* failure (timeout, missing binary,
+    non-zero exit, or unparseable output — i.e. the scheduler could not be
+    reached/understood) raises :class:`CondorQueryError`.  An empty queue
+    (exit 0, no jobs matched) is a valid result and returns ``[]`` regardless.
+    """
     cmd = ["condor_q", "-json", "-attributes", ",".join(_SUBPROCESS_ATTRS)]
     if schedd_name:
         cmd += ["-name", schedd_name]
@@ -131,15 +176,32 @@ def _query_via_subprocess(
             text=True,
             timeout=10,
         )
-        if result.returncode != 0 or not result.stdout.strip():
-            return []
-        data = json.loads(result.stdout)
-        return data if isinstance(data, list) else []
-    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        if raise_on_error:
+            raise CondorQueryError(f"condor_q failed: {exc}") from exc
         return []
+
+    if result.returncode != 0:
+        if raise_on_error:
+            raise CondorQueryError(
+                f"condor_q exited {result.returncode}: {result.stderr.strip()[:200]}"
+            )
+        return []
+    if not result.stdout.strip():
+        return []  # exit 0, no jobs matched — a valid empty result
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        if raise_on_error:
+            raise CondorQueryError(
+                f"condor_q returned unparseable JSON: {exc}"
+            ) from exc
+        return []
+    return data if isinstance(data, list) else []
 
 
 # ─── Public interface ─────────────────────────────────────────────────────────
+
 
 def query_queue(
     constraint: Optional[str] = None,
@@ -149,11 +211,17 @@ def query_queue(
     cert_path: Optional[str] = None,
     key_path: Optional[str] = None,
     password_file: Optional[str] = None,
+    raise_on_error: bool = False,
 ) -> List[Dict]:
     """Query the HTCondor job queue.
 
     Returns a list of job ClassAd dicts (may be empty).
-    Never raises; errors are swallowed silently.
+
+    By default never raises; errors are swallowed and an empty list is
+    returned.  When ``raise_on_error=True``, a hard failure to reach/parse the
+    scheduler raises :class:`CondorQueryError` (an empty-but-valid result still
+    returns ``[]``).  The server poll loop uses this to drive adaptive back-off
+    when the schedd is down or overloaded.
 
     Parameters
     ----------
@@ -164,6 +232,8 @@ def query_queue(
     cert_path:       Path to GSI certificate.
     key_path:        Path to GSI private key.
     password_file:   Path to a password file.
+    raise_on_error:  Raise CondorQueryError on hard failure instead of
+                     returning an empty list.
     """
     # Apply credential environment variables
     if cert_path:
@@ -185,21 +255,39 @@ def query_queue(
     if result is not None:
         return result
 
-    # Fall back to subprocess
-    return _query_via_subprocess(constraint=constraint, schedd_name=schedd_name)
+    # Fall back to subprocess. The bindings returning None means "unavailable
+    # or failed to reach the schedd" — so the subprocess attempt is also our
+    # reachability probe; let it surface a hard failure when asked.
+    return _query_via_subprocess(
+        constraint=constraint,
+        schedd_name=schedd_name,
+        raise_on_error=raise_on_error,
+    )
 
 
 # ─── History attributes (Tier 3) ────────────────────────────────────────────
 
 _HISTORY_ATTRS = [
-    "ClusterId", "ProcId", "DAGNodeName", "Owner", "Cmd",
-    "JobStatus", "ExitCode",
-    "RemoteWallClockTime", "RemoteUserCpu", "RemoteSysCpu",
+    "ClusterId",
+    "ProcId",
+    "DAGNodeName",
+    "Owner",
+    "Cmd",
+    "JobStatus",
+    "ExitCode",
+    "RemoteWallClockTime",
+    "RemoteUserCpu",
+    "RemoteSysCpu",
     "CumulativeRemoteUserCpu",
-    "RequestCpus", "RequestMemory", "RequestDisk", "RequestGpus",
-    "ImageSize", "DiskUsage",
+    "RequestCpus",
+    "RequestMemory",
+    "RequestDisk",
+    "RequestGpus",
+    "ImageSize",
+    "DiskUsage",
     "LastRemoteHost",
-    "BytesSent", "BytesRecvd",
+    "BytesSent",
+    "BytesRecvd",
     "NumJobStarts",
 ]
 
@@ -218,6 +306,7 @@ def _try_history_bindings(
     for mod_name in ("htcondor", "htcondor2"):
         try:
             import importlib
+
             ht = importlib.import_module(mod_name)
         except ImportError:
             continue
@@ -258,9 +347,12 @@ def _history_via_subprocess(
 ) -> List[Dict]:
     """Query HTCondor history via ``condor_history -json``."""
     cmd = [
-        "condor_history", "-json",
-        "-attributes", ",".join(_HISTORY_ATTRS),
-        "-match", str(match),
+        "condor_history",
+        "-json",
+        "-attributes",
+        ",".join(_HISTORY_ATTRS),
+        "-match",
+        str(match),
     ]
     if schedd_name:
         cmd += ["-name", schedd_name]
@@ -466,12 +558,19 @@ SLOT_ACTIVITY: Dict[str, str] = {
 }
 
 _SLOT_ATTRS = [
-    "Name", "Machine", "SlotType",
-    "Cpus", "Memory", "Disk",
-    "TotalSlotCpus", "TotalSlotMemory",
+    "Name",
+    "Machine",
+    "SlotType",
+    "Cpus",
+    "Memory",
+    "Disk",
+    "TotalSlotCpus",
+    "TotalSlotMemory",
     "TotalLoadAvg",
-    "Activity", "State",
-    "OpSys", "Arch",
+    "Activity",
+    "State",
+    "OpSys",
+    "Arch",
     "GPUs",
 ]
 
@@ -479,10 +578,11 @@ _SLOT_ATTRS = [
 @dataclass
 class PoolSummary:
     """Aggregated pool resource summary from condor_status."""
+
     total_slots: int = 0
     idle_slots: int = 0
     claimed_slots: int = 0
-    other_slots: int = 0       # Preempting, Vacating, etc.
+    other_slots: int = 0  # Preempting, Vacating, etc.
     total_cpus: int = 0
     idle_cpus: int = 0
     total_memory_mb: int = 0
@@ -492,7 +592,7 @@ class PoolSummary:
     idle_gpus: int = 0
     machines: int = 0
     load_avg: float = 0.0
-    os_arch: str = ""          # e.g. "LINUX/X86_64"
+    os_arch: str = ""  # e.g. "LINUX/X86_64"
     # Raw slot ads for detailed inspection (not serialized to JSONL)
     slots: List[Dict] = field(default_factory=list, repr=False)
 
@@ -660,6 +760,7 @@ def _try_slots_bindings(
     for mod_name in ("htcondor", "htcondor2"):
         try:
             import importlib
+
             ht = importlib.import_module(mod_name)
         except ImportError:
             continue
@@ -685,8 +786,10 @@ def _slots_via_subprocess(
 ) -> List[Dict]:
     """Query slot status via ``condor_status -json``."""
     cmd = [
-        "condor_status", "-json",
-        "-attributes", ",".join(_SLOT_ATTRS),
+        "condor_status",
+        "-json",
+        "-attributes",
+        ",".join(_SLOT_ATTRS),
     ]
     if collector_host:
         cmd += ["-pool", collector_host]
