@@ -21,6 +21,7 @@ from .braindump import WorkflowInfo
 from .db import StampedeDB, WorkflowSnapshot
 from .event_log import EventLogger
 from .htcondor_poll import (
+    CondorBackoff,
     PoolSummary,
     query_history,
     query_queue,

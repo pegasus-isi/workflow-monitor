@@ -30,6 +30,7 @@ from .diagnostics import collect_diagnostics
 from .event_log import EventLogger
 from .stats import WorkflowStats, compute_workflow_stats
 from .htcondor_poll import (
+    CondorBackoff,
     query_queue,
     query_history,
     query_slots,
