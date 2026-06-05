@@ -63,28 +63,35 @@ failures. When the `schedd` was down or overloaded, every cycle still fired a
 query that burned its full 10–15 s timeout — i.e. the monitor hit the scheduler
 *hardest exactly when it was most fragile*.
 
-**Fix.** The daemon loop now backs off when condor queries hard-fail:
+**Fix.** A shared `CondorBackoff` **gate** (in `htcondor_poll.py`) now throttles
+the condor poll in **both** the `--serve` daemon and the live TUI:
 
-- On a hard failure (timeout, non-zero exit, missing binary, unparseable output)
-  the sleep grows **exponentially** — `2 s → 4 → 8 → … capped at 60 s` — and
-  **snaps back** to the base interval the instant a query succeeds.
-- Every idle sleep carries a little **jitter** so multiple monitors sharing one
-  `schedd` never poll in lock-step (thundering-herd avoidance).
+- The gate **opens every cycle while healthy** and, after a hard failure (timeout,
+  non-zero exit, missing binary, unparseable output), reopens only on an
+  **exponentially growing** interval — `2 s → 4 → 8 → … capped at 60 s` — with
+  **jitter** (no lock-step across monitors sharing a `schedd`). It **snaps back**
+  to base cadence the instant a query succeeds.
+- **Only the condor query is gated, not the loop.** Local `stampede.db` and the
+  TUI keep refreshing at the base interval, so the live view never freezes during
+  an outage. A gated/failed cycle reuses the **last-good** queue result (the
+  fingerprint dedup then emits nothing new) rather than flapping to an empty
+  queue. While the scheduler is failing, the already-throttled `condor_history`
+  and `condor_status` polls are **suppressed** too, so the *only* traffic to a
+  down `schedd` is the backed-off `condor_q` probe.
 - An **empty-but-valid** queue (exit 0, no jobs matched) is *not* a failure, so an
   idle or between-stages workflow never triggers back-off.
-- **Scope is deliberate.** Back-off keys on the *scheduler* (the shared, remote,
-  fragile resource). Local `stampede.db` polling is left at full cadence: its
-  transient `mode=ro` lock contention is normal and self-resolves in
-  milliseconds, so backing off on it would only make the monitor sluggish for no
-  benefit. When the main loop backs off, the already-throttled history/pool
-  polls naturally slow with it.
+- **DB polling is intentionally never backed off.** Its transient `mode=ro` lock
+  contention is normal and self-resolves in milliseconds; throttling it would only
+  make the monitor sluggish for no benefit.
+- **Visibility.** The daemon logs entering/leaving back-off to its `.pid.log`. The
+  live TUI shows a yellow **`SCHEDD?`** header badge while the scheduler is
+  unreachable (no stderr writes — those would corrupt the full-screen UI).
 
-Mechanism: `query_queue(raise_on_error=True)` now distinguishes a hard failure
-(raises the new `CondorQueryError`) from a valid empty result (returns `[]`).
-The default contract is unchanged — `raise_on_error` defaults to `False`, so the
-live display, `--once`, and `--why-idle` paths behave exactly as before. The
-daemon counts consecutive failures and feeds `server._backoff_sleep()`. Entering
-and leaving back-off is logged to the daemon's `.pid.log` for visibility.
+Mechanism: `query_queue(raise_on_error=True)` distinguishes a hard failure (raises
+the new `CondorQueryError`) from a valid empty result (returns `[]`); the gate
+(`CondorBackoff.due()` / `.record()`) decides per-cycle whether to query. The
+default contract is unchanged — `raise_on_error` defaults to `False`, so
+`--once`, `--why-idle`, replay, and remote paths behave exactly as before.
 
 ### Changed
 
@@ -93,18 +100,20 @@ and leaving back-off is logged to the daemon's `.pid.log` for visibility.
   factored into `_write_raw`.
 - `htcondor_poll.query_queue` / `_query_via_subprocess` gain `raise_on_error`
   (default `False`); empty stdout with exit 0 is now explicitly a valid empty
-  result, never an error.
-- `server.run_server`, `display.run_monitor` gain `min_free_mb` / `max_log_mb`
-  pass-through; `server`'s main-loop sleep is now `_backoff_sleep(...)`.
+  result, never an error. New `CondorBackoff` gate class.
+- `server.run_server` and `display.run_monitor` gate the condor poll through a
+  `CondorBackoff` (keeping DB/loop at base cadence); both gain `min_free_mb` /
+  `max_log_mb` pass-through. The live TUI gains a `SCHEDD?` header badge
+  (`_make_header` / `build_layout` take a `condor_offline` flag).
 
 ### Files touched
 
 | File | Change |
 |---|---|
 | `src/workflow_monitor/event_log.py` | Disk-exhaustion guard (`_disk_ok`, `_force_pause`, `_resume`, `_write_raw`); resilient `close()` |
-| `src/workflow_monitor/htcondor_poll.py` | `CondorQueryError`; `raise_on_error` on `query_queue` / `_query_via_subprocess` |
-| `src/workflow_monitor/server.py` | `_backoff_sleep`, `_MAX_BACKOFF_SECONDS`, failure-streak tracking in `_poll_condor`, back-off sleep; guard pass-through |
-| `src/workflow_monitor/display.py` | Disk-guard pass-through to `EventLogger` |
+| `src/workflow_monitor/htcondor_poll.py` | `CondorQueryError`; `CondorBackoff` gate; `raise_on_error` on `query_queue` / `_query_via_subprocess` |
+| `src/workflow_monitor/server.py` | `CondorBackoff`-gated `_poll_condor`, last-good cache, history/pool suppressed during outage; guard pass-through |
+| `src/workflow_monitor/display.py` | Same `CondorBackoff` gate in the live loop; `SCHEDD?` header badge; disk-guard pass-through to `EventLogger` |
 | `src/workflow_monitor/cli.py` | `--min-free-mb` / `--max-log-mb` flags; wired into serve + live modes |
 | `DATA_SOURCES.md` | Documented `log_paused` / `log_resumed` control events (§9) |
 | `MONITORD-v-WORKFLOW-MONITOR.md` | Updated safeguards §9.3–9.5, §9.8 to reflect the implemented guards |
@@ -122,8 +131,15 @@ and leaving back-off is logged to the daemon's `.pid.log` for visibility.
 
 Verified with standalone checks (no live workflow required):
 
-- `_backoff_sleep`: base+jitter at streak 0; exponential `4→8→16`; cap at 60 s;
-  jitter bounds hold across streaks 0–24.
+- `CondorBackoff` gate: `due()` open while healthy; closes for an exponentially
+  growing window (`≥4 s → ≥8 s …`) after failures; `record()` returns the
+  recovery edge exactly once; cap at 60 s holds across 20 failures; an
+  empty-but-valid result counts as success.
+- Gated `_poll_condor` simulation: during a 4-cycle outage only the due cycles
+  issue a real query (one is gated/skipped), the closure returns the last-good
+  result each cycle (so the DB/UI loop is never delayed), and it recovers cleanly.
+- `SCHEDD?` header badge renders when `condor_offline=True` and is absent
+  otherwise.
 - `CondorQueryError`: raised on timeout / non-zero exit / unparseable JSON only
   when `raise_on_error=True`; an empty queue (exit 0) **never** raises; valid
   JSON returns the parsed list.

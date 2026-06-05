@@ -78,14 +78,14 @@ add derived stats and interpretive diagnostics that monitord never produces.
 ## 1. Architectural positioning
 
 ```
-                 ┌──────────────────────────────────────────────────────────┐
+                 ┌────────────────────────────────────────────────────────────┐
                  │  condor logs, *.dagman.out, *.out.NNN kickstart records    │
-                 └───────────────┬──────────────────────────────────────────┘
+                 └───────────────┬────────────────────────────────────────────┘
                                  │ parses (event-driven)
                                  ▼
                          pegasus-monitord
                                  │ emits stampede.* NetLogger events
-        ┌────────────────────────┼───────────────────────────────────┐
+        ┌────────────────────────┼────────────────────────────────────┐
         │ BP/BSON encode         │ JSON encode                        │
         ▼                        ▼                                    ▼
    <dag>.stampede.db        AMQP exchange (RabbitMQ) ──▶ Logstash ──▶ Elasticsearch
@@ -158,7 +158,7 @@ the key to reading anything in Elasticsearch.
 ```
 emitter writes:        kwargs["xwf__id"]        (double underscore)     workflow.py
                               │
-        ┌─────────────────────┼─────────────────────────────┐
+        ┌─────────────────────┼──────────────────────────────┐
         │ BP / DB path                                       │ JSON / AMQP / ES path
         ▼                                                    ▼
  nlapi._append / DBEventSink.send:                    json_encode():
@@ -542,15 +542,19 @@ monitor is throttled on four axes:
 - **Deduplication.** Queue and pool snapshots are content-fingerprinted and `condor_history`
   results are de-duplicated by `ClusterId`, so repeated polls do almost no work and emit
   nothing when nothing changed (`server.py`; see §7 item 12).
-- **Adaptive back-off (`--serve`).** When the `schedd` is down or overloaded — a condor query
-  hard-fails (timeout, non-zero exit, missing binary) — the daemon's poll cadence backs off
-  *exponentially* (2 s → 4 → 8 … capped at 60 s) instead of retrying at full rate every cycle,
-  and snaps back to the base interval the moment a query succeeds. Each idle sleep also carries
-  a little **jitter** so multiple monitors sharing one `schedd` never poll in lock-step. Local
-  `stampede.db` polling is unaffected — only the scheduler cadence backs off (`server.py`,
-  `_backoff_sleep`; the failure signal is `query_queue(raise_on_error=True)` →
-  `CondorQueryError` in `htcondor_poll.py`). An *empty but valid* queue is never treated as a
-  failure, so an idle workflow does not trigger back-off.
+- **Adaptive back-off (live TUI *and* `--serve`).** A shared `CondorBackoff` **gate** throttles
+  the condor poll when the `schedd` is down or overloaded — a query hard-fails (timeout,
+  non-zero exit, missing binary). The gate reopens only on an *exponentially* growing interval
+  (2 s → 4 → 8 … capped at 60 s) with **jitter** (no lock-step across monitors), and snaps back
+  to base cadence the moment a query succeeds. Crucially it gates **only the condor query, not
+  the loop**: local `stampede.db` and the TUI keep refreshing every cycle, so the view never
+  freezes during an outage; a gated cycle reuses the **last-good** queue (so the fingerprint
+  dedup emits nothing new), and while failing, `condor_history`/`condor_status` are suppressed
+  too — leaving the backed-off `condor_q` probe as the *only* traffic to a struggling scheduler
+  (`htcondor_poll.py`, `CondorBackoff`; failure signal `query_queue(raise_on_error=True)` →
+  `CondorQueryError`). An *empty but valid* queue is never a failure, so an idle workflow does
+  not trigger back-off. The daemon logs back-off to its `.pid.log`; the live TUI shows a
+  **`SCHEDD?`** header badge instead.
 
 ### 9.4 Failure isolation: degrade, never disrupt
 
@@ -564,10 +568,11 @@ The monitor is designed so that *its own* failures never propagate outward:
   `query_queue`/`query_slots`). Callers that need to *act* on failure opt in explicitly
   (`raise_on_error=True`); the live display and one-shot modes do not, so they degrade exactly
   as before.
-- There are **no aggressive retry storms**: a failed query yields empty data for that cycle,
-  and under `--serve` the poll cadence then *backs off* rather than retrying at full rate
-  (§9.3). The workflow never sees back-pressure from the observer — the load it can place on a
-  struggling scheduler *decreases* as failures persist.
+- There are **no aggressive retry storms**: a failed query reuses the last-good result for that
+  cycle, and the condor poll then *backs off* (in both the live TUI and `--serve`) rather than
+  retrying at full rate (§9.3). The workflow never sees back-pressure from the observer — the
+  load it can place on a struggling scheduler *decreases* as failures persist, while the
+  monitor's own local DB/UI refresh keeps running at full cadence.
 
 ### 9.5 Writes stay in the monitor's own lane
 
@@ -631,7 +636,7 @@ scheduler load.
 |---|---|---|---|
 | `stampede.db` (monitord is writing it) | SELECT-only reads | `file:…?mode=ro`, `timeout=5.0` (`db.py:245`) | Cannot take a write lock or block monitord |
 | HTCondor `schedd` / `collector` | 5 read-only queries | `condor_q`/`history`/`status`/`userprio`; `query`/`history`/`locate` only | Cannot modify / remove / hold / release a job |
-| Scheduler load | Throttled + adaptive polling | timeouts + tiered cadence + fingerprint dedup + **exponential back-off w/ jitter when the schedd fails** | Bounded rate that *decreases* when the scheduler struggles |
+| Scheduler load | Throttled + adaptive polling | timeouts + tiered cadence + fingerprint dedup + **`CondorBackoff` gate (exponential + jitter, both TUI & `--serve`); local DB/UI unaffected** | Bounded rate that *decreases* when the scheduler struggles; UI never freezes |
 | The monitor's own faults | Degrade quietly | catch `OperationalError`; never raises by default; back off instead of retry-storm | Observer failure never reaches the workflow |
 | Submit-directory **filesystem** | Bounded, append-only sidecars | new `*.jsonl`/`.pid` files; **pause below `--min-free-mb` / above `--max-log-mb`**; `--log` to relocate | No Pegasus artifact modified; cannot fill the workflow's volume |
 | Remediation | Advice only | text `suggestions`; no exec of condor actions | Nothing is actuated automatically |

@@ -68,6 +68,7 @@ def _make_header(
     replay_info: Optional[dict] = None,
     remote_info: Optional[dict] = None,
     stall_active: bool = False,
+    condor_offline: bool = False,
 ) -> Panel:
     grid = Table.grid(expand=True, padding=(0, 0))
     grid.add_column(ratio=1)
@@ -94,6 +95,11 @@ def _make_header(
     if stall_active:
         title.append("  ")
         title.append(" STALL ", style="bold white on red")
+    if condor_offline:
+        # Scheduler is unreachable; condor-derived columns may be stale while
+        # the monitor backs off and retries. DB-driven state keeps updating.
+        title.append("  ")
+        title.append(" SCHEDD? ", style="bold black on yellow")
 
     right_col = Text(no_wrap=True)
     if replay_info is not None or remote_info is not None:
@@ -678,6 +684,7 @@ def build_layout(
     diag_alerts: Optional[List[Dict]] = None,
     diag_path: Optional[str] = None,
     sort_by_activity: bool = True,
+    condor_offline: bool = False,
 ) -> Layout:
     has_issues = snap.held_count() > 0 or snap.failed_count() > 0
     has_alerts = bool(diag_alerts)
@@ -752,6 +759,7 @@ def build_layout(
             replay_info=replay_info,
             remote_info=remote_info,
             stall_active=has_alerts,
+            condor_offline=condor_offline,
         )
     )
     layout["status"].update(_make_status_bar(snap))
@@ -846,11 +854,27 @@ def run_monitor(
         )
         console.print(f"[dim]Diagnostics sidecar: {diag_path}[/dim]")
 
+    # Adaptive gate: the TUI keeps refreshing local DB state every cycle, but
+    # the live condor queue is polled less often when the scheduler is failing
+    # so a struggling schedd is never hammered and the UI never freezes. The
+    # last good queue is reused while gated/failed (no stderr output here — it
+    # would corrupt the full-screen Live; the state is shown via a header badge).
+    condor_backoff = CondorBackoff(poll_interval)
+    _last_condor_jobs: List = []
+
     def _poll_condor() -> List:
+        nonlocal _last_condor_jobs
+        now = time.time()
+        if not condor_backoff.due(now):
+            return _last_condor_jobs
         try:
-            return query_queue(constraint=condor_constraint, **ck)
+            jobs = query_queue(constraint=condor_constraint, raise_on_error=True, **ck)
         except Exception:
-            return []
+            condor_backoff.record(False, now)
+            return _last_condor_jobs
+        condor_backoff.record(True, now)
+        _last_condor_jobs = jobs
+        return jobs
 
     # History cache: accumulates completed job records, refreshed every
     # few poll cycles to avoid hammering condor_history each second.
@@ -861,6 +885,9 @@ def run_monitor(
     def _poll_history() -> List:
         nonlocal _history_cache, _history_last_poll
         now = time.time()
+        # While the scheduler is failing, skip history too (don't add load).
+        if condor_backoff.fail_streak > 0:
+            return _history_cache
         if now - _history_last_poll < _HISTORY_INTERVAL:
             return _history_cache
         try:
@@ -886,6 +913,8 @@ def run_monitor(
     def _poll_pool() -> Optional[PoolSummary]:
         nonlocal _pool_cache, _pool_last_poll
         now = time.time()
+        if condor_backoff.fail_streak > 0:
+            return _pool_cache  # scheduler failing — skip pool queries too
         if now - _pool_last_poll < _POOL_INTERVAL:
             return _pool_cache
         try:
@@ -1001,6 +1030,7 @@ def run_monitor(
                     else None,
                     diag_path=str(diag_engine.path) if diag_engine else None,
                     sort_by_activity=sort_by_activity,
+                    condor_offline=condor_backoff.fail_streak > 0,
                 )
                 live.update(layout)
 
@@ -1024,6 +1054,7 @@ def run_monitor(
                             else None,
                             diag_path=str(diag_engine.path) if diag_engine else None,
                             sort_by_activity=sort_by_activity,
+                            condor_offline=condor_backoff.fail_streak > 0,
                         )
                     )
                     break

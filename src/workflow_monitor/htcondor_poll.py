@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -47,6 +48,66 @@ class CondorQueryError(RuntimeError):
     empty result is returned.  Note that an *empty but valid* result (no jobs
     matched) is **not** an error and never raises.
     """
+
+
+class CondorBackoff:
+    """Adaptive gate for HTCondor polling.
+
+    Lets a monitoring loop keep refreshing *local* state (stampede.db, the TUI)
+    at its base cadence while querying a *failing* scheduler less and less
+    often, so a down or overloaded ``schedd`` is never hammered — and so the
+    user's view of workflow progress never freezes just because condor is
+    unreachable.
+
+    Each cycle, call :meth:`due` to decide whether to run a condor query now;
+    after the attempt, call :meth:`record`::
+
+        if backoff.due(now):
+            try:
+                jobs = query_queue(..., raise_on_error=True)
+                backoff.record(True, now)
+            except CondorQueryError:
+                backoff.record(False, now)
+
+    On success the gate opens every cycle (base cadence).  After consecutive
+    failures it opens only on an exponentially growing interval — ``base`` → 2×
+    → 4× … capped at ``max_backoff`` — with jitter so multiple monitors sharing
+    one ``schedd`` do not retry in lock-step.  An *empty but valid* result is a
+    success, not a failure, so an idle workflow never triggers back-off.
+    """
+
+    def __init__(self, base_interval: float, max_backoff: float = 60.0) -> None:
+        self._base = max(base_interval, 0.1)
+        self._max = max_backoff
+        self.fail_streak = 0
+        self._retry_at = 0.0
+
+    def due(self, now: float) -> bool:
+        """Whether a condor query is allowed this cycle."""
+        return self.fail_streak == 0 or now >= self._retry_at
+
+    def record(self, ok: bool, now: float) -> bool:
+        """Update state after a query attempt.
+
+        Returns ``True`` only on a failure→recovery transition, so a caller can
+        log "reachable again" exactly once.
+        """
+        if ok:
+            recovered = self.fail_streak > 0
+            self.fail_streak = 0
+            self._retry_at = 0.0
+            return recovered
+        self.fail_streak += 1
+        delay = min(self._base * (2 ** min(self.fail_streak, 10)), self._max)
+        delay += random.uniform(0, min(delay * 0.1, 5.0))
+        self._retry_at = now + delay
+        return False
+
+    def next_retry_in(self, now: float) -> float:
+        """Seconds until the next allowed condor poll (0 when due now)."""
+        if self.fail_streak == 0:
+            return 0.0
+        return max(0.0, self._retry_at - now)
 
 
 # ─── Python bindings (preferred) ─────────────────────────────────────────────
