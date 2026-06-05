@@ -10,7 +10,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 Two safeguards that strengthen `workflow-monitor`'s core promise: as an
 **external, observe-only** layer it must never burden the Pegasus workflow it
 watches. Both follow from the producer-vs-consumer analysis in
-[`MONITORD-v-WORKFLOW-MONITOR.md`](MONITORD-v-WORKFLOW-MONITOR.md) §9; they close
+[`TELEMETRY-COMPARISON.md`](TELEMETRY-COMPARISON.md) §9; they close
 the two remaining ways an external observer could still hurt a live run — filling
 the workflow's disk, and hammering a struggling scheduler.
 
@@ -116,7 +116,7 @@ default contract is unchanged — `raise_on_error` defaults to `False`, so
 | `src/workflow_monitor/display.py` | Same `CondorBackoff` gate in the live loop; `SCHEDD?` header badge; disk-guard pass-through to `EventLogger` |
 | `src/workflow_monitor/cli.py` | `--min-free-mb` / `--max-log-mb` flags; wired into serve + live modes |
 | `DATA_SOURCES.md` | Documented `log_paused` / `log_resumed` control events (§9) |
-| `MONITORD-v-WORKFLOW-MONITOR.md` | Updated safeguards §9.3–9.5, §9.8 to reflect the implemented guards |
+| `TELEMETRY-COMPARISON.md` | Updated safeguards §9.3–9.5, §9.8 to reflect the implemented guards (renamed from `MONITORD-v-WORKFLOW-MONITOR.md`) |
 
 ### Compatibility
 
