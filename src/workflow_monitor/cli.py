@@ -11,6 +11,7 @@ from . import __version__
 from .braindump import load_braindump
 from .db import StampedeDB
 from .display import run_monitor
+from .stampede_stream import StampedeStreamReader
 
 
 DESCRIPTION = """\
@@ -88,6 +89,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="One-shot diagnostic: explain why workflow jobs are idle, then exit",
+    )
+    p.add_argument(
+        "--source",
+        choices=("auto", "live", "db"),
+        default="auto",
+        help="Where to read Pegasus workflow events from: "
+        "'live' tails pegasus-monitord's monitord-events.jsonl (events as "
+        "monitord parses them, before they reach the stampede DB); "
+        "'db' polls the stampede SQLite database; "
+        "'auto' (default) uses the live stream when monitord-events.jsonl "
+        "exists in the submit dir, else falls back to the database.",
     )
     p.add_argument(
         "--remap-submit-dir",
@@ -328,14 +340,39 @@ def main(argv: list | None = None) -> int:
         return 1
 
     db_path = info.stampede_db
-    if db_path is None:
+    events_path = info.monitord_events_path
+
+    # ── Select the Pegasus event source ───────────────────────────────────────
+    # 'live' tails monitord-events.jsonl (events as monitord parses them);
+    # 'db' polls the stampede SQLite DB; 'auto' prefers the live stream when
+    # present, else the DB.  The live stream needs no DB; the DB path needs no
+    # live stream.
+    use_live = args.source == "live" or (args.source == "auto" and events_path.exists())
+
+    if use_live:
+        if args.source == "live" and not events_path.exists():
+            print(
+                f"[warn] Live source requested but {events_path} does not exist "
+                "yet; waiting for pegasus-monitord to create it "
+                "(enable it with pegasus.monitord.wfmonitor.url).",
+                file=sys.stderr,
+            )
+    elif db_path is None:
         print(
             f"[error] Stampede database not found in: {info.submit_dir}\n"
             "  Make sure pegasus-monitord is running (it is started automatically\n"
-            "  by pegasus-run / pegasus-plan --submit).",
+            "  by pegasus-run / pegasus-plan --submit).\n"
+            "  For live, pre-DB events, run monitord with "
+            "pegasus.monitord.wfmonitor.url and use --source live.",
             file=sys.stderr,
         )
         return 1
+
+    def make_source():
+        """Open the chosen event source (StampedeDB or live stream reader)."""
+        if use_live:
+            return StampedeStreamReader(events_path, wf_uuid=info.wf_uuid)
+        return StampedeDB(db_path, wf_uuid=info.wf_uuid)
 
     # ── Build condor kwargs ───────────────────────────────────────────────────
     condor_kwargs: dict = {}
@@ -380,7 +417,7 @@ def main(argv: list | None = None) -> int:
             f' && substr(Cmd, 0, {len(recorded_submit_str)}) == "{submit_dir_esc}"'
         )
 
-        with StampedeDB(db_path, wf_uuid=info.wf_uuid) as db:
+        with make_source() as db:
             snap = db.snapshot()
 
         return run_why_idle(
@@ -415,7 +452,7 @@ def main(argv: list | None = None) -> int:
     if args.serve or args.serve_foreground:
         from .server import run_server
 
-        with StampedeDB(db_path, wf_uuid=info.wf_uuid) as db:
+        with make_source() as db:
             run_server(
                 info=info,
                 db=db,
@@ -431,7 +468,7 @@ def main(argv: list | None = None) -> int:
         return 0
 
     # ── Run monitor ───────────────────────────────────────────────────────────
-    with StampedeDB(db_path, wf_uuid=info.wf_uuid) as db:
+    with make_source() as db:
         run_monitor(
             info=info,
             db=db,

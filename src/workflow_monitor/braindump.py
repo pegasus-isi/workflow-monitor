@@ -1,4 +1,5 @@
 """Parse Pegasus braindump.yml to locate workflow artifacts."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -36,6 +37,22 @@ class WorkflowInfo:
         """Path to the stampede SQLite database (written by pegasus-monitord)."""
         stem = self.dag_file.replace(".dag", "")
         p = self.submit_dir / f"{stem}.stampede.db"
+        return p if p.exists() else None
+
+    @property
+    def monitord_events_path(self) -> Path:
+        """Default path for pegasus-monitord's live native-event JSONL.
+
+        Written by Pegasus' ``WorkflowMonitorEventSink`` when monitord is run
+        with ``pegasus.monitord.wfmonitor.url``. May not exist (the feature is
+        opt-in); use :attr:`monitord_events` for an existence-checked variant.
+        """
+        return self.submit_dir / "monitord-events.jsonl"
+
+    @property
+    def monitord_events(self) -> Optional[Path]:
+        """Live monitord event JSONL path, or None if it doesn't exist yet."""
+        p = self.monitord_events_path
         return p if p.exists() else None
 
     @property
