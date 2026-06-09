@@ -20,6 +20,12 @@ htcondor = ["htcondor"]
 [project.scripts]
 workflow-monitor = "workflow_monitor.cli:main"
 
+# Registers the live pegasus-monitord plugin. When this package is installed in
+# the same environment as Pegasus, monitord discovers it and (when enabled via
+# pegasus.monitord.plugins.wfmonitor.enabled=true) feeds workflow-monitor live.
+[project.entry-points."pegasus.monitord.plugins"]
+wfmonitor = "workflow_monitor.monitord_plugin:WorkflowMonitorPlugin"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/workflow_monitor"]
 
