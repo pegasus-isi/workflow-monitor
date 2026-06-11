@@ -84,6 +84,7 @@ def run_server(
     diagnose: bool = False,
     min_free_mb: float = 200.0,
     max_log_mb: Optional[float] = None,
+    enable_condor_polling: bool = True,
 ) -> None:
     """Run the headless monitoring server.
 
@@ -105,6 +106,9 @@ def run_server(
     foreground:        If True, run in foreground (don't daemonize).
     min_free_mb:       Pause event logging below this much free space (MB).
     max_log_mb:        Optional hard cap on the JSONL size (MB); None = unbounded.
+    enable_condor_polling: If False, skip all condor_q/history/status queries
+                       (the wfmonitor monitord plugin is polling instead); the
+                       stampede.db loop and diagnostics are unaffected.
     """
     ck = condor_kwargs or {}
 
@@ -162,6 +166,8 @@ def run_server(
 
     def _poll_condor():
         nonlocal last_condor_jobs
+        if not enable_condor_polling:
+            return last_condor_jobs  # stays []; EventLogger emits nothing
         now = time.time()
         if not condor_backoff.due(now):
             return last_condor_jobs  # gated — do not hit a struggling schedd
@@ -191,6 +197,8 @@ def run_server(
 
     def _poll_history():
         nonlocal history_cache, history_last_poll
+        if not enable_condor_polling:
+            return history_cache  # stays []
         now = time.time()
         # While the scheduler is failing, skip history too — don't pile more
         # (already-throttled) queries onto a struggling schedd.
@@ -218,6 +226,8 @@ def run_server(
 
     def _poll_pool():
         nonlocal pool_cache, pool_last_poll
+        if not enable_condor_polling:
+            return pool_cache  # stays None
         now = time.time()
         if condor_backoff.fail_streak > 0:
             return pool_cache  # scheduler failing — skip pool queries too

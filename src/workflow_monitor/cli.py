@@ -208,6 +208,15 @@ def build_parser() -> argparse.ArgumentParser:
     # ── HTCondor options ─────────────────────────────────────────────────────
     condor = p.add_argument_group("HTCondor options")
     condor.add_argument(
+        "--condor-poll",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Poll condor_q/history/status in --serve. Use --no-condor-poll "
+        "when the wfmonitor monitord plugin already polls condor "
+        "(pegasus.monitord.plugins.wfmonitor.condor_poll=true), so the two "
+        "paths don't double-poll the schedd",
+    )
+    condor.add_argument(
         "--schedd",
         metavar="NAME",
         help="Query a specific condor_schedd by name",
@@ -427,6 +436,7 @@ def main(argv: list | None = None) -> int:
                 diagnose=args.diagnose,
                 min_free_mb=args.min_free_mb,
                 max_log_mb=args.max_log_mb,
+                enable_condor_polling=args.condor_poll,
             )
         return 0
 
