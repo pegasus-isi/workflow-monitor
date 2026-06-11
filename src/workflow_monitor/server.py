@@ -105,6 +105,7 @@ def run_server(
     diagnose: bool = False,
     min_free_mb: float = 200.0,
     max_log_mb: Optional[float] = None,
+    enable_condor_polling: bool = True,
 ) -> None:
     """Run the headless monitoring server.
 
@@ -126,6 +127,9 @@ def run_server(
     foreground:        If True, run in foreground (don't daemonize).
     min_free_mb:       Pause event logging below this much free space (MB).
     max_log_mb:        Optional hard cap on the JSONL size (MB); None = unbounded.
+    enable_condor_polling: If False, skip all condor_q/history/status queries
+                       (the wfmonitor monitord plugin is polling instead); the
+                       stampede.db loop and diagnostics are unaffected.
     """
     ck = condor_kwargs or {}
 
@@ -174,24 +178,37 @@ def run_server(
         )
         print(f"Diagnostics enabled — sidecar: {diag_path}")
 
+    class _DisabledCondorPoller:
+        """No-op poller used when pegasus-monitord's plugin owns condor polling."""
+
+        def __init__(self) -> None:
+            self.history_cache: list = []
+            self.pool_cache = None
+
+        def poll(self) -> tuple:
+            return [], self.history_cache, self.pool_cache
+
     # Adaptive gate: keep the loop (stampede.db) at base cadence, but poll the
     # condor queue less often when the scheduler is failing — the poller caches
     # the last good result so a gated/failed cycle reuses it (and the fingerprint
     # dedup emits nothing new) rather than flapping to an empty queue.
-    poller = CondorPoller(
-        poll_interval,
-        condor_constraint=condor_constraint,
-        condor_kwargs=ck,
-        on_condor_down=lambda exc: print(
-            f"[backoff] condor query failed ({exc}); polling less frequently "
-            f"until the scheduler recovers",
-            file=sys.stderr,
-        ),
-        on_condor_up=lambda: print(
-            "[backoff] condor reachable again; resuming normal poll cadence",
-            file=sys.stderr,
-        ),
-    )
+    if enable_condor_polling:
+        poller = CondorPoller(
+            poll_interval,
+            condor_constraint=condor_constraint,
+            condor_kwargs=ck,
+            on_condor_down=lambda exc: print(
+                f"[backoff] condor query failed ({exc}); polling less frequently "
+                f"until the scheduler recovers",
+                file=sys.stderr,
+            ),
+            on_condor_up=lambda: print(
+                "[backoff] condor reachable again; resuming normal poll cadence",
+                file=sys.stderr,
+            ),
+        )
+    else:
+        poller = _DisabledCondorPoller()
 
     snap: Optional[WorkflowSnapshot] = None
 
