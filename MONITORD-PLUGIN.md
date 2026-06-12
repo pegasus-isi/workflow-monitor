@@ -43,7 +43,7 @@ the TUI, or forward however you like.
 
   If that import fails, your Pegasus predates the plugin system. (The three
   files are overlayable onto an existing 5.1.x install; the in-plugin condor
-  polling additionally needs the `tick()` hook, commit `2a6a23fca` or later.)
+  polling additionally needs the `tick()` hook, commit `f929618c6` or later.)
   The plugin host's user documentation is in the Pegasus reference guide
   under *Monitoring → pegasus-monitord → Event Plugins*.
 
