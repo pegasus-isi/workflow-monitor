@@ -169,6 +169,27 @@ def test_tick_skips_until_wf_plan_then_uses_constraint(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
+def test_classad_exprtree_values_serialize(tmp_path, monkeypatch):
+    """The bindings path returns dict(ad) with classad.ExprTree values; _write
+    must stringify them (default=str, EventLogger parity), not raise."""
+
+    class _ExprTreeLike:
+        def __str__(self):
+            return "RemoteHost =?= undefined"
+
+    job = _job()
+    job["MemoryUsage"] = _ExprTreeLike()
+    monkeypatch.setattr(mp, "query_queue", lambda **kw: [job])
+    monkeypatch.setattr(mp, "query_history", lambda **kw: [])
+    monkeypatch.setattr(mp, "query_slots", lambda **kw: None)
+    plugin = _start(tmp_path, monkeypatch)
+    _send_wf_plan(plugin)
+    plugin.tick()
+    (rec,) = _records(tmp_path, "htcondor_poll")
+    assert rec["jobs"][0]["MemoryUsage"] == "RemoteHost =?= undefined"
+    plugin.stop()
+
+
 def test_queue_fingerprint_dedup(tmp_path, monkeypatch):
     jobs = [[_job(status=1)], [_job(status=1)], [_job(status=2)]]
     it = iter(jobs)
