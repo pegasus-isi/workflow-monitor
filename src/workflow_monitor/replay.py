@@ -1,4 +1,5 @@
 """JSONL replay engine for workflow monitor."""
+
 from __future__ import annotations
 
 import json
@@ -80,8 +81,10 @@ class ReplayEngine:
             if etype == "workflow_start":
                 # Extra header from a resumed session — skip
                 continue
-            if etype == "jobs_init" and cleaned and any(
-                e.get("event_type") == "jobs_init" for e in cleaned
+            if (
+                etype == "jobs_init"
+                and cleaned
+                and any(e.get("event_type") == "jobs_init" for e in cleaned)
             ):
                 # Duplicate jobs_init — skip
                 continue
@@ -95,7 +98,8 @@ class ReplayEngine:
                 break
         if final_end_idx is not None:
             cleaned = [
-                ev for i, ev in enumerate(cleaned)
+                ev
+                for i, ev in enumerate(cleaned)
                 if ev.get("event_type") != "workflow_end" or i == final_end_idx
             ]
 
@@ -280,17 +284,21 @@ class ReplayEngine:
                     elif state == "EXECUTE" and js["start_time"] is None:
                         js["start_time"] = ts
                     elif state in (
-                        "JOB_TERMINATED", "JOB_SUCCESS", "JOB_FAILURE",
+                        "JOB_TERMINATED",
+                        "JOB_SUCCESS",
+                        "JOB_FAILURE",
                     ):
                         js["end_time"] = ts
 
                     # Add to recent events list
-                    recent_events.append({
-                        "exec_job_id": ev.get("exec_job_id"),
-                        "type_desc": ev.get("type_desc"),
-                        "state": state,
-                        "timestamp": ts,
-                    })
+                    recent_events.append(
+                        {
+                            "exec_job_id": ev.get("exec_job_id"),
+                            "type_desc": ev.get("type_desc"),
+                            "state": state,
+                            "timestamp": ts,
+                        }
+                    )
 
             elif etype == "workflow_end":
                 wf_state = ev.get("wf_state", wf_state)
@@ -303,7 +311,7 @@ class ReplayEngine:
             wf_start = self._header_wf_start
 
         # Trim recent events to last N
-        recent_events[:] = recent_events[-self._events_n:]
+        recent_events[:] = recent_events[-self._events_n :]
 
         # Build snapshot with frame_ts as poll_time and _now on each JobRecord
         jobs = [
@@ -401,18 +409,28 @@ class ReplayEngine:
                         elif ev.get("event_type") == "pool_status":
                             pool_status = PoolSummary.from_dict(ev.get("pool", {}))
                         elif ev.get("event_type") == "workflow_stats":
-                            workflow_stats = WorkflowStats.from_dict(ev.get("stats", {}))
+                            workflow_stats = WorkflowStats.from_dict(
+                                ev.get("stats", {})
+                            )
 
-                    snap, wf_state, wf_status, wf_start, wf_end = (
-                        self._reconstruct(
-                            frame, job_state, wf_state, wf_status,
-                            wf_start, wf_end, recent_events, frame_ts,
-                        )
+                    snap, wf_state, wf_status, wf_start, wf_end = self._reconstruct(
+                        frame,
+                        job_state,
+                        wf_state,
+                        wf_status,
+                        wf_start,
+                        wf_end,
+                        recent_events,
+                        frame_ts,
                     )
 
                     layout = build_layout(
-                        info, snap, show_all, condor_jobs,
-                        self._events_n, frame_ts,
+                        info,
+                        snap,
+                        show_all,
+                        condor_jobs,
+                        self._events_n,
+                        frame_ts,
                         replay_info=replay_info,
                         condor_history=condor_history,
                         pool_status=pool_status,
@@ -435,5 +453,9 @@ class ReplayEngine:
 
         # Final summary — reuse the same stats display as live mode
         if workflow_stats is None:
-            workflow_stats = compute_workflow_stats(snap)
+            workflow_stats = compute_workflow_stats(
+                snap,
+                condor_history=condor_history,
+                pool_status=pool_status,
+            )
         _print_final_summary(console, snap, stats=workflow_stats)
