@@ -1,15 +1,21 @@
 # `pegasus-monitord` (→ Elasticsearch) vs. `workflow-monitor` (→ JSONL)
 
-A field-level comparison of the two ways workflow telemetry leaves a Pegasus run:
+A field-level comparison of the ways workflow telemetry leaves a Pegasus run:
 
 1. **`pegasus-monitord`** — Pegasus's own monitoring daemon, which can stream *NetLogger
    "stampede" events* to an AMQP broker (RabbitMQ) for ingestion into Elasticsearch.
 2. **`workflow-monitor`** — this project, which polls the artifacts monitord produces and
    writes its own `workflow-events.jsonl` (optionally shipped to Elasticsearch by a
    downstream Vector pipeline).
+3. **the `wfmonitor` monitord plugin** *(added 2026-06)* — this project again, but running
+   **inside** monitord via the `pegasus.monitord.plugins` entry-point system: the same
+   workflow-monitor JSONL schema, produced event-driven at the source (and, optionally,
+   the HTCondor polling too) — see [§12](#12-the-third-path-the-wfmonitor-monitord-plugin)
+   and the usage guide in [`MONITORD-PLUGIN.md`](MONITORD-PLUGIN.md).
 
-Both can land in indices with similar names, but the **document shapes are not
-interchangeable**. This document enumerates every difference and weighs the trade-offs.
+All can land in indices with similar names, but the **document shapes of paths 1 and 2 are
+not interchangeable** (path 3 deliberately reuses path 2's shapes). This document
+enumerates every difference and weighs the trade-offs.
 
 > **Provenance.** The monitord details below are extracted from the version-matched local
 > install, **Pegasus 5.1.2-dev.0**:
@@ -47,6 +53,7 @@ interchangeable**. This document enumerates every difference and weighs the trad
 | 9.8 | &nbsp;&nbsp;[Safeguard summary](#98-safeguard-summary) | One table: surface → mechanism → guarantee |
 | 10 | [Practical Elasticsearch implications](#10-practical-elasticsearch-implications) | Field-name and index-collision gotchas |
 | 11 | [When to use which](#11-when-to-use-which) | Decision guidance; how they compose |
+| 12 | [The third path: the wfmonitor monitord plugin](#12-the-third-path-the-wfmonitor-monitord-plugin) | Push instead of poll — same JSONL schema, emitted from inside monitord; measured equivalence |
 | — | [Sources](#sources) | Pegasus source files, repo files, and docs |
 
 ---
@@ -97,11 +104,17 @@ add derived stats and interpretive diagnostics that monitord never produces.
         │                 diagnostics-events.jsonl                          [workflow-events-* / workflow-diag-*]
         ▼
    Rich TUI / --serve / --remote / --replay
+
+   (third path, 2026: the wfmonitor PLUGIN runs inside pegasus-monitord itself and
+    writes monitord-events.jsonl — workflow-monitor's schema, event-driven, with
+    optional in-plugin condor polling via the host's tick(); see §12)
 ```
 
 The crucial structural fact: **monitord is upstream of `stampede.db`; workflow-monitor is
 downstream of it.** workflow-monitor's `job_state` events are therefore a *second-order*
-re-materialization of the very events monitord emitted — see the round-trip in §5.
+re-materialization of the very events monitord emitted — see the round-trip in §5. (The
+§12 plugin removes that second order: it materializes the same records *first-order*,
+from the live event stream, before the DB round-trip.)
 
 ---
 
@@ -673,9 +686,61 @@ scheduler load.
 - **Use workflow-monitor → JSONL** when you want an at-a-glance live TUI, scheduler-side
   insight (queue, pool, efficiency, *why* a job is idle/stalled), zero-infra local capture,
   and easy replay — accepting that it's a derived, poll-bounded view.
-- **They compose.** Run monitord for the canonical record and workflow-monitor for the
-  HTCondor-native + diagnostic layer; correlate on the workflow UUID
-  (`xwf_id` ⇔ `wf_uuid`).
+- **Use the wfmonitor monitord plugin (§12)** when your Pegasus has the monitord plugin
+  system and you want workflow-monitor's JSONL **without the poll latency and without a
+  second process**: the same records, emitted event-driven from inside monitord, with the
+  HTCondor polling optionally folded into the same plugin thread. Setup:
+  [`MONITORD-PLUGIN.md`](MONITORD-PLUGIN.md).
+- **They compose.** Run monitord for the canonical record and workflow-monitor (either the
+  polling monitor or the plugin) for the HTCondor-native + diagnostic layer; correlate on
+  the workflow UUID (`xwf_id` ⇔ `wf_uuid`). The plugin and the standalone monitor also
+  compose with each other — just pass `--no-condor-poll` to `--serve` when the plugin owns
+  the condor polling, so the schedd is queried once, not twice.
+
+---
+
+## 12. The third path: the wfmonitor monitord plugin
+
+The 2026-06 `pegasus.monitord.plugins` entry-point system in monitord (branch
+`monitord-plugin-system`) made a third path possible, and this repo ships it:
+`workflow_monitor/monitord_plugin.py` registers `wfmonitor`, which runs on a dedicated
+thread **inside monitord** and translates the live stampede event stream into the *same*
+JSONL records §6 catalogs (`workflow_start`, `jobs_init`, `job_state`, `workflow_state`),
+written to `monitord-events.jsonl`. With `condor_poll = true` it also emits
+`htcondor_poll`/`htcondor_history`/`pool_status` from the plugin host's `tick()` — the
+scheduler-side layer of §0's right-hand column, without the polling process.
+
+How it shifts this document's trade-off table:
+
+- **Emission trigger:** event-driven (like monitord's own sinks), not poll-bounded —
+  `job_state` records appear as monitord parses the transition, seconds before the polling
+  path can see the same row land in `stampede.db` and read it back out.
+- **Document shape:** identical to workflow-monitor's (path 2) by construction — the
+  §3 key-naming discussion and §10's index-collision warnings apply between paths 1 and
+  2/3 exactly as written.
+- **Safeguards (§9):** the read-only/bounded-polling guarantees carry over, now enforced
+  by the plugin host as well: bounded queue (drop-on-overflow), daemon worker thread,
+  exception isolation, bounded shutdown join. The plugin never blocks monitord; condor
+  queries stay constraint-scoped, backoff-gated, and fingerprint-deduped.
+- **What it does *not* replace:** the TUI, `--remote`, diagnostics, and `workflow_stats`
+  still come from the standalone monitor (which can run alongside; see §11), and the
+  stampede DB remains the canonical record — plugin delivery is best-effort by design.
+
+**Measured equivalence** (FABRIC testbed, 2026-06-12, plugin tick 5s vs. `--serve` 2s
+loop, both paths capturing the same runs):
+
+| Run | Path | `job_state`-bearing events | `htcondor_poll` | `htcondor_history` | `pool_status` |
+|---|---|---|---|---|---|
+| diamond (12 jobs) | plugin | 88 + condor | 7 | 3 | 5 |
+| diamond (12 jobs) | polling | — | 8 | 3 | 5 |
+| earthquake (19 containerized jobs) | plugin | 137 + condor | 15 | 5 | 7 |
+| earthquake (19 containerized jobs) | polling | — | 20 | 5 | 10 |
+
+Identical history capture; the 2s polling loop buys only ~25–30% more queue/pool
+snapshots than the 5s in-monitord tick — i.e., the single-process plugin configuration
+loses very little scheduler-side fidelity.
+
+Setup and configuration: [`MONITORD-PLUGIN.md`](MONITORD-PLUGIN.md).
 
 ---
 
