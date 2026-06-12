@@ -138,6 +138,11 @@ class WorkflowMonitorPlugin(MonitordEventPlugin):
         self._job_task = {}  # exec_job_id -> task_id
         self._job_extra = {}  # exec_job_id -> {exitcode, stdout_file, stderr_file, maxrss, site}
         self._job_seq = 0
+        # Termination state for the synthesized workflow_end (see stop()).
+        self._wf_start_ts = None
+        self._wf_end_ts = None
+        self._wf_status = None
+        self._job_terminal = {}  # exec_job_id -> last terminal state (JOB_SUCCESS/JOB_FAILURE)
         # Condor polling state (active only with condor_poll=true; see tick()).
         self._condor_poll = False
         self._condor_constraint = None  # built from wf.plan's submit_dir
@@ -243,6 +248,38 @@ class WorkflowMonitorPlugin(MonitordEventPlugin):
             except Exception:
                 log.error(
                     "wfmonitor final condor flush failed: %s",
+                    traceback.format_exc(),
+                )
+        # Terminal marker, synthesized from accumulated state (EventLogger
+        # shape). workflow-monitor --remote/--replay key stream completion on
+        # workflow_end; without --serve (whose EventLogger provides it on the
+        # polling path) the plugin stream would never end a --remote session.
+        # Emitted as the LAST record (after the condor flush; a poll event
+        # after an end marker reads as a server resume to the consumer), and
+        # only when xwf.end was actually seen, so a killed monitord cannot
+        # fake completion.
+        if self._output is not None and self._wf_end_ts is not None:
+            try:
+                done = sum(1 for s in self._job_terminal.values() if s == "JOB_SUCCESS")
+                failed = sum(
+                    1 for s in self._job_terminal.values() if s == "JOB_FAILURE"
+                )
+                rec = {
+                    "event_type": "workflow_end",
+                    "timestamp": time.time(),
+                    "wf_state": "WORKFLOW_TERMINATED",
+                    "wf_status": self._wf_status,
+                    "wf_end": self._wf_end_ts,
+                    "total_jobs": len(self._job_info),
+                    "done": done,
+                    "failed": failed,
+                }
+                if self._wf_start_ts is not None:
+                    rec["elapsed"] = self._wf_end_ts - self._wf_start_ts
+                self._write(rec)
+            except Exception:
+                log.error(
+                    "wfmonitor workflow_end emission failed: %s",
                     traceback.format_exc(),
                 )
         if self._output is not None:
@@ -530,8 +567,11 @@ class WorkflowMonitorPlugin(MonitordEventPlugin):
         }
         if state == "WORKFLOW_STARTED":
             rec["wf_start"] = d.get("ts")
+            self._wf_start_ts = d.get("ts")
         else:
             rec["wf_end"] = d.get("ts")
+            self._wf_end_ts = d.get("ts")
+            self._wf_status = rec["status"]
         self._write(rec)
 
     def _on_inv_end(self, d):
@@ -553,6 +593,9 @@ class WorkflowMonitorPlugin(MonitordEventPlugin):
         idx = self._as_int(d.get("status"))
         idx = 1 if idx is None else max(0, min(1, idx + 1))
         state = self._JOB_STATES[full][idx]
+        if state in ("JOB_SUCCESS", "JOB_FAILURE"):
+            # Last terminal state wins (a retried job that succeeds counts done).
+            self._job_terminal[name] = state
 
         # Carry forward per-job enrichment as it becomes known.
         extra = self._job_extra.setdefault(name, {})

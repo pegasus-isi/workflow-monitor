@@ -318,3 +318,77 @@ def test_no_condor_poll_flag():
     p = build_parser()
     assert p.parse_args(["--serve"]).condor_poll is True
     assert p.parse_args(["--serve", "--no-condor-poll"]).condor_poll is False
+
+
+# --------------------------------------------------------------------------- #
+# synthesized workflow_end terminal marker
+# --------------------------------------------------------------------------- #
+
+
+def test_workflow_end_emitted_on_stop(tmp_path, monkeypatch):
+    plugin = _start(tmp_path, monkeypatch, condor_poll=False)
+    _send_wf_plan(plugin)
+    plugin.handle_event(
+        "stampede.job.info", {"xwf__id": "uuid-1", "job__id": "j1", "ts": 692252}
+    )
+    plugin.handle_event(
+        "stampede.job.info", {"xwf__id": "uuid-1", "job__id": "j2", "ts": 692253}
+    )
+    plugin.handle_event("stampede.static.end", {"xwf__id": "uuid-1", "ts": 692254})
+    plugin.handle_event("stampede.xwf.start", {"xwf__id": "uuid-1", "ts": 1.78e9 + 10})
+    plugin.handle_event(
+        "stampede.job_inst.main.end",
+        {"xwf__id": "uuid-1", "ts": 1.78e9 + 20, "job__id": "j1", "status": 0},
+    )
+    plugin.handle_event(
+        "stampede.job_inst.main.end",
+        {"xwf__id": "uuid-1", "ts": 1.78e9 + 30, "job__id": "j2", "status": -1},
+    )
+    plugin.handle_event(  # retry succeeds
+        "stampede.job_inst.main.end",
+        {"xwf__id": "uuid-1", "ts": 1.78e9 + 40, "job__id": "j2", "status": 0},
+    )
+    plugin.handle_event(
+        "stampede.xwf.end", {"xwf__id": "uuid-1", "ts": 1.78e9 + 100, "status": 0}
+    )
+    plugin.stop()
+
+    recs = _records(tmp_path)
+    end = recs[-1]
+    assert end["event_type"] == "workflow_end"  # the LAST record
+    assert end["wf_state"] == "WORKFLOW_TERMINATED"
+    assert end["wf_status"] == 0
+    assert end["wf_end"] == 1.78e9 + 100
+    assert end["total_jobs"] == 2
+    assert end["done"] == 2  # retried j2 counts done (last terminal state wins)
+    assert end["failed"] == 0
+    assert end["elapsed"] == 90
+
+
+def test_no_workflow_end_without_termination(tmp_path, monkeypatch):
+    plugin = _start(tmp_path, monkeypatch, condor_poll=False)
+    _send_wf_plan(plugin)
+    plugin.handle_event("stampede.xwf.start", {"xwf__id": "uuid-1", "ts": 1.78e9 + 10})
+    plugin.stop()  # monitord killed mid-run: no xwf.end seen
+
+    assert _records(tmp_path, "workflow_end") == []
+
+
+def test_workflow_end_is_last_after_final_flush(tmp_path, monkeypatch):
+    """The terminal marker must follow the final condor flush — a poll event
+    after workflow_end reads as a server resume to the --remote consumer."""
+    monkeypatch.setattr(mp, "query_queue", lambda **kw: [_job(status=4)])
+    monkeypatch.setattr(mp, "query_history", lambda **kw: [_job(7, status=4)])
+    monkeypatch.setattr(mp, "query_slots", lambda **kw: _FakePool(claimed=0))
+    plugin = _start(tmp_path, monkeypatch)
+    _send_wf_plan(plugin)
+    plugin.handle_event(
+        "stampede.xwf.end", {"xwf__id": "uuid-1", "ts": 1.78e9 + 50, "status": 0}
+    )
+
+    plugin.stop()
+    recs = _records(tmp_path)
+    assert recs[-1]["event_type"] == "workflow_end"
+    assert {"htcondor_poll", "htcondor_history", "pool_status"} <= {
+        r["event_type"] for r in recs[:-1]
+    }
