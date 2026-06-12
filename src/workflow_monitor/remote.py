@@ -6,6 +6,7 @@ displays it in the Rich TUI, following new events as they arrive.
 Usage (from cli.py):
     workflow-monitor --remote user@host:/path/to/workflow-events.jsonl
 """
+
 from __future__ import annotations
 
 import json
@@ -51,7 +52,7 @@ def _parse_remote_spec(spec: str) -> tuple[str, str]:
                 "Expected format: user@[IPv6]:/path/to/workflow-events.jsonl"
             )
         host_part = spec[:colon_pos]
-        remote_path = spec[colon_pos + 1:]
+        remote_path = spec[colon_pos + 1 :]
     else:
         if ":" not in spec:
             raise ValueError(
@@ -125,7 +126,10 @@ def _fetch_file(
     try:
         with open(local_path, write_mode) as fh:
             result = subprocess.run(
-                cmd, stdout=fh, stderr=subprocess.PIPE, timeout=60,
+                cmd,
+                stdout=fh,
+                stderr=subprocess.PIPE,
+                timeout=60,
             )
         if result.returncode == 0:
             new_size = local_path.stat().st_size
@@ -205,7 +209,10 @@ class RemoteEngine:
     def _do_sync(self) -> tuple[bool, str]:
         """Fetch the remote file via SSH (incremental after first sync)."""
         ok, err, new_offset = _fetch_file(
-            self._host, self._remote_path, self._local_path, self._ssh_base,
+            self._host,
+            self._remote_path,
+            self._local_path,
+            self._ssh_base,
             byte_offset=self._remote_offset,
         )
         if ok:
@@ -220,8 +227,11 @@ class RemoteEngine:
     def _sync_diagnostics(self) -> None:
         """Best-effort fetch of the diagnostics sidecar. Failures are silent."""
         ok, _err, new_offset = _fetch_file(
-            self._host, self._diag_remote_path, self._diag_local_path,
-            self._ssh_base, byte_offset=self._diag_remote_offset,
+            self._host,
+            self._diag_remote_path,
+            self._diag_local_path,
+            self._ssh_base,
+            byte_offset=self._diag_remote_offset,
         )
         if not ok:
             return
@@ -232,8 +242,11 @@ class RemoteEngine:
             self._diag_processed_lines = 0
             self._diag_active_alerts.clear()
             ok, _err, new_offset = _fetch_file(
-                self._host, self._diag_remote_path, self._diag_local_path,
-                self._ssh_base, byte_offset=0,
+                self._host,
+                self._diag_remote_path,
+                self._diag_local_path,
+                self._ssh_base,
+                byte_offset=0,
             )
             if not ok:
                 return
@@ -264,8 +277,10 @@ class RemoteEngine:
                     elif et == "stall_resolved":
                         self._diag_active_alerts.clear()
                     elif et in (
-                        "stall_detected", "idle_diagnosis",
-                        "hold_diagnosis", "failure_diagnosis",
+                        "stall_detected",
+                        "idle_diagnosis",
+                        "hold_diagnosis",
+                        "failure_diagnosis",
                     ):
                         self._diag_active_alerts.append(ev)
                 self._diag_processed_lines = total
@@ -374,6 +389,7 @@ class RemoteEngine:
                 ts = ev.get("timestamp")
                 if ev.get("exitcode") is not None:
                     from .db import real_exitcode
+
                     js["exitcode"] = real_exitcode(ev["exitcode"])
                 # Capture runtime metadata when present
                 if ev.get("stdout_file"):
@@ -390,12 +406,14 @@ class RemoteEngine:
                 elif state in ("JOB_TERMINATED", "JOB_SUCCESS", "JOB_FAILURE"):
                     js["end_time"] = ts
 
-                self._recent_events.append({
-                    "exec_job_id": ev.get("exec_job_id"),
-                    "type_desc": ev.get("type_desc"),
-                    "state": state,
-                    "timestamp": ts,
-                })
+                self._recent_events.append(
+                    {
+                        "exec_job_id": ev.get("exec_job_id"),
+                        "type_desc": ev.get("type_desc"),
+                        "state": state,
+                        "timestamp": ts,
+                    }
+                )
 
         elif etype == "htcondor_poll":
             self._condor_jobs = ev.get("jobs")
@@ -418,7 +436,9 @@ class RemoteEngine:
 
         # Any non-end event after a workflow_end means the server resumed
         if self._pending_workflow_end is not None and etype in (
-            "job_state", "workflow_state", "htcondor_poll",
+            "job_state",
+            "workflow_state",
+            "htcondor_poll",
         ):
             self._pending_workflow_end = None
             self._workflow_complete = False
@@ -428,7 +448,7 @@ class RemoteEngine:
             self._wf_start = self._header_wf_start
 
         # Trim recent events
-        self._recent_events = self._recent_events[-self._events_n:]
+        self._recent_events = self._recent_events[-self._events_n :]
 
     def _finalize_batch(self) -> None:
         """After processing all events from a sync, resolve any pending
@@ -481,7 +501,9 @@ class RemoteEngine:
             poll_time=now,
         )
 
-    def run(self, show_all: bool = False, once: bool = False, sort_by_activity: bool = True) -> None:
+    def run(
+        self, show_all: bool = False, once: bool = False, sort_by_activity: bool = True
+    ) -> None:
         """Run the remote monitoring TUI."""
         console = Console()
 
@@ -536,18 +558,36 @@ class RemoteEngine:
                 _make_events_panel,
             )
 
-            console.print(_make_header(info, snap, snap.poll_time, remote_info=remote_info))
+            console.print(
+                _make_header(info, snap, snap.poll_time, remote_info=remote_info)
+            )
             console.print(_make_status_bar(snap))
             if snap.held_count() > 0 or snap.failed_count() > 0:
-                console.print(_make_diagnostics_panel(snap, condor_jobs=self._condor_jobs))
-            console.print(_make_job_table(snap, show_all=show_all, condor_jobs=self._condor_jobs, condor_history=self._condor_history, sort_by_activity=sort_by_activity))
+                console.print(
+                    _make_diagnostics_panel(snap, condor_jobs=self._condor_jobs)
+                )
+            console.print(
+                _make_job_table(
+                    snap,
+                    show_all=show_all,
+                    condor_jobs=self._condor_jobs,
+                    condor_history=self._condor_history,
+                    sort_by_activity=sort_by_activity,
+                )
+            )
             if snap.infra_jobs():
                 console.print(_make_infra_summary(snap))
             if self._pool_status is not None:
                 console.print(_make_pool_panel(self._pool_status))
             console.print(_make_events_panel(snap, n=self._events_n))
-            stats = self._workflow_stats or compute_workflow_stats(snap)
-            _print_final_summary(console, snap, condor_jobs=self._condor_jobs, stats=stats)
+            stats = self._workflow_stats or compute_workflow_stats(
+                snap,
+                condor_history=self._condor_history,
+                pool_status=self._pool_status,
+            )
+            _print_final_summary(
+                console, snap, condor_jobs=self._condor_jobs, stats=stats
+            )
             self._cleanup()
             return
 
@@ -569,15 +609,22 @@ class RemoteEngine:
                     # Update display with current state
                     snap = self._build_snapshot()
                     layout = build_layout(
-                        info, snap, show_all, self._condor_jobs,
-                        self._events_n, snap.poll_time,
+                        info,
+                        snap,
+                        show_all,
+                        self._condor_jobs,
+                        self._events_n,
+                        snap.poll_time,
                         remote_info=remote_info,
                         condor_history=self._condor_history,
                         pool_status=self._pool_status,
-                        diag_alerts=list(self._diag_active_alerts) if self._diag_active_alerts else None,
+                        diag_alerts=list(self._diag_active_alerts)
+                        if self._diag_active_alerts
+                        else None,
                         diag_path=(
                             f"{self._host}:{self._diag_remote_path}"
-                            if self._diag_seen else None
+                            if self._diag_seen
+                            else None
                         ),
                         sort_by_activity=sort_by_activity,
                     )
@@ -606,7 +653,11 @@ class RemoteEngine:
                 pass
 
         # Final summary — use unified stats display
-        stats = self._workflow_stats or compute_workflow_stats(snap)
+        stats = self._workflow_stats or compute_workflow_stats(
+            snap,
+            condor_history=self._condor_history,
+            pool_status=self._pool_status,
+        )
         _print_final_summary(console, snap, condor_jobs=self._condor_jobs, stats=stats)
 
         self._cleanup()
