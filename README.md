@@ -58,6 +58,7 @@ A real-time terminal dashboard for monitoring running [Pegasus WMS](https://pega
 - **Event logging** — `--log` captures every workflow and job state transition to a JSONL file for replay or post-hoc analysis
 - **Replay mode** — `--replay` reads a JSONL event log and visually replays the workflow in the TUI at configurable speed (`--speed`)
 - **Client/Server mode** — `--serve` runs a headless daemon on the workflow machine that logs events continuously; `--remote` connects from any machine via SSH to display the workflow in the TUI
+- **pegasus-monitord plugin** — on Pegasus builds with the monitord plugin system, the bundled `wfmonitor` plugin runs *inside* `pegasus-monitord` and writes the same JSONL schema event-driven (no polling, no second process), optionally including the HTCondor queue/history/pool polling on the plugin's own thread — see [`MONITORD-PLUGIN.md`](MONITORD-PLUGIN.md)
 
 ## Requirements
 
