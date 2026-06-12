@@ -375,7 +375,11 @@ class WorkflowMonitorPlugin(MonitordEventPlugin):
 
     def _write(self, record):
         record.setdefault("wf_uuid", self._wf_uuid)
-        self._output.write(json.dumps(record) + "\n")
+        # default=str matches EventLogger._write_raw: the htcondor
+        # python-bindings path returns ClassAds via dict(ad), whose values can
+        # be classad.ExprTree (unevaluated expressions, not JSON
+        # serializable). Stringify anything exotic instead of dying mid-tick.
+        self._output.write(json.dumps(record, default=str) + "\n")
 
     @staticmethod
     def _as_int(value):
