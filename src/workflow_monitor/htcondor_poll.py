@@ -273,6 +273,56 @@ class CondorPoller:
 # ─── Python bindings (preferred) ─────────────────────────────────────────────
 
 
+_EVAL_MISS = object()
+
+
+def _clean_classad_value(val: Any) -> Any:
+    """Normalize a ClassAd-evaluated value for JSON serialization.
+
+    Native JSON scalars pass through; ClassAd ``Undefined``/``Error`` sentinels
+    become None and any residual ``ExprTree`` becomes its string form, so a
+    stray expression never reaches a numeric consumer as a live object.
+    """
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    if type(val).__name__ == "Value":  # classad.Value.Undefined / .Error
+        return None
+    return str(val)
+
+
+def _ad_to_dict(ad: Any) -> Dict[str, Any]:
+    """Convert a ClassAd to a plain dict with expression attributes evaluated.
+
+    ``dict(ad)`` leaves expression-valued attributes as ``classad.ExprTree``
+    objects -- notably RequestMemory, whose HTCondor default is
+    ``ifthenelse(MemoryUsage isnt undefined, MemoryUsage, (ImageSize + 1023) / 1024)``.
+    Used directly (or serialized with ``json.dumps(default=str)``) those are the
+    raw expression, which int()/float() consumers cannot parse. Evaluating each
+    attribute in the ad's own context (``ClassAd.eval``) resolves RequestMemory
+    and friends to numbers; attributes that cannot be evaluated fall back to
+    their raw value. Non-ClassAd mappings round-trip unchanged.
+    """
+    keys_fn = getattr(ad, "keys", None)
+    if keys_fn is None:
+        return dict(ad)
+    eval_fn = getattr(ad, "eval", None)
+    out: Dict[str, Any] = {}
+    for key in list(keys_fn()):
+        val = _EVAL_MISS
+        if eval_fn is not None:
+            try:
+                val = eval_fn(key)
+            except Exception:
+                val = _EVAL_MISS
+        if val is _EVAL_MISS:
+            try:
+                val = ad[key]
+            except Exception:
+                continue
+        out[key] = _clean_classad_value(val)
+    return out
+
+
 def _try_python_bindings(
     constraint: Optional[str] = None,
     schedd_name: Optional[str] = None,
@@ -337,7 +387,7 @@ def _try_python_bindings(
             if constraint:
                 q_args["constraint"] = constraint
 
-            jobs = [dict(ad) for ad in schedd.query(**q_args)]
+            jobs = [_ad_to_dict(ad) for ad in schedd.query(**q_args)]
             return jobs
         except Exception:
             continue
@@ -553,7 +603,7 @@ def _try_history_bindings(
             if constraint:
                 h_args["constraint"] = constraint
 
-            jobs = [dict(ad) for ad in schedd.history(**h_args)]
+            jobs = [_ad_to_dict(ad) for ad in schedd.history(**h_args)]
             return jobs
         except Exception:
             continue
@@ -656,22 +706,46 @@ def format_job_status(status_code: Any) -> str:
         return str(status_code)
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    """Best-effort int from a ClassAd value, or None if not a literal number.
+
+    HTCondor request attributes are frequently unevaluated expressions rather
+    than literals -- RequestMemory defaults to
+    ``ifthenelse(MemoryUsage isnt undefined, MemoryUsage, (ImageSize + 1023) / 1024)``.
+    Over the plugin/--remote JSON path these arrive as expression strings (the
+    ``classad.ExprTree`` was stringified at serialization); in live mode they
+    arrive as ExprTree objects. Neither is int()-able, so return None and let
+    the caller omit the field rather than crash the display.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+
 def format_resources(ad: Dict) -> str:
-    """Format resource requests as a compact string like '2c/4G' or '1c/2G/1gpu'."""
+    """Format resource requests as a compact string like '2c/4G' or '1c/2G/1gpu'.
+
+    Any request attribute that is an unevaluated ClassAd expression rather than
+    a literal number is skipped (see _coerce_int)."""
     parts = []
-    cpus = ad.get("RequestCpus")
+    cpus = _coerce_int(ad.get("RequestCpus"))
     if cpus is not None:
-        parts.append(f"{int(cpus)}c")
-    mem = ad.get("RequestMemory")
-    if mem is not None:
-        mem_mb = int(mem)
+        parts.append(f"{cpus}c")
+    mem_mb = _coerce_int(ad.get("RequestMemory"))
+    if mem_mb is not None:
         if mem_mb >= 1024:
             parts.append(f"{mem_mb / 1024:.1f}G")
         else:
             parts.append(f"{mem_mb}M")
-    gpus = ad.get("RequestGpus")
-    if gpus is not None and int(gpus) > 0:
-        parts.append(f"{int(gpus)}gpu")
+    gpus = _coerce_int(ad.get("RequestGpus"))
+    if gpus is not None and gpus > 0:
+        parts.append(f"{gpus}gpu")
     return "/".join(parts) if parts else ""
 
 
@@ -997,7 +1071,7 @@ def _try_slots_bindings(
                 ht.AdTypes.Startd,
                 projection=_SLOT_ATTRS,
             )
-            return [dict(ad) for ad in ads]
+            return [_ad_to_dict(ad) for ad in ads]
         except Exception:
             continue
 
