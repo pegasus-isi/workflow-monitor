@@ -147,7 +147,7 @@ ORDER BY timestamp
 | `stdout_file` | str | Relative path to job stdout | Used to locate kickstart output for diagnostics |
 | `stderr_file` | str | Relative path to job stderr | Used for failure diagnostics |
 
-**Note on `exitcode`:** The raw value is in wait-status format. Values > 128 are decoded as `raw >> 8` to get the actual exit code. The `real_exitcode()` function in `db.py` handles this conversion.
+**Note on `exitcode`:** The raw value is a POSIX `wait()` status, not the final exit code. The `real_exitcode()` function in `db.py` decodes it: a normal exit carries its status in the high byte (`exit(N)` → `N << 8`, so `exit(1)` → 256), while a signal kill carries the signal in the low 7 bits with bit `0x80` set on a core dump (SIGKILL → 9 or 137, SIGSEGV → 11 or 139). Normal exits decode to `(raw >> 8) & 0xFF`; signal kills decode to the shell convention `128 + signal` (137, 139, …) so they line up with the `_FAILURE_SUGGESTIONS` keys. (Earlier this used a plain `raw >> 8`, which collapsed core-dump statuses like 137/139 to 0.)
 
 #### `jobstate` table — Job state transitions
 

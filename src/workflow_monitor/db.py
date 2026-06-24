@@ -1,9 +1,10 @@
 """Query the Pegasus stampede SQLite database for workflow monitoring data."""
+
 from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -80,12 +81,34 @@ def fmt_timestamp(ts: Optional[float]) -> str:
 
 
 def real_exitcode(raw: Optional[int]) -> Optional[int]:
-    """Convert raw wait status to real exit code."""
+    """Decode a raw POSIX ``wait()`` status into a conventional exit code.
+
+    The stampede ``job_instance.exitcode`` column stores the raw wait status
+    (see DATA_SOURCES.md), not the final code:
+
+    * Normal termination puts the exit status in the high byte, so ``exit(N)``
+      is stored as ``N << 8`` (``exit(1)`` -> 256, ``exit(127)`` -> 32512).
+    * Termination by a signal puts the signal number in the low 7 bits, with
+      bit ``0x80`` set when a core was dumped — so SIGKILL is 9 or 137 and
+      SIGSEGV is 11 or 139.
+
+    We return the exit status for a normal exit and the shell convention
+    ``128 + signal`` for a signal kill, matching the codes the failure
+    diagnostics key on (137 = OOM/SIGKILL, 139 = SIGSEGV). The previous
+    ``raw >> 8`` shortcut mis-decoded core-dump statuses (137/139 -> 0) and
+    reported bare signal numbers for kills without a core. ``None`` passes
+    through; a negative sentinel is returned unchanged.
+    """
     if raw is None:
         return None
-    if raw > 128:
-        return raw >> 8
-    return raw
+    if raw < 0:
+        return raw
+    sig = raw & 0x7F
+    # sig == 0 is WIFEXITED; sig == 0x7F is WIFSTOPPED (never seen for a reaped
+    # job) — decode both from the high byte rather than as a phantom signal.
+    if sig in (0, 0x7F):
+        return (raw >> 8) & 0xFF
+    return 128 + sig
 
 
 def fmt_memory(maxrss_kb: Optional[int]) -> str:
@@ -99,6 +122,7 @@ def fmt_memory(maxrss_kb: Optional[int]) -> str:
 
 
 # ─── Data classes ─────────────────────────────────────────────────────────────
+
 
 @dataclass
 class JobRecord:
@@ -125,9 +149,9 @@ class JobRecord:
 
     @property
     def duration(self) -> Optional[float]:
-        if self.start_time and self.end_time:
+        if self.start_time is not None and self.end_time is not None:
             return self.end_time - self.start_time
-        if self.start_time and self.disp_state == "RUNNING":
+        if self.start_time is not None and self.disp_state == "RUNNING":
             now = self._now if self._now is not None else datetime.now().timestamp()
             return now - self.start_time
         return None
@@ -153,8 +177,8 @@ class JobRecord:
 
 @dataclass
 class WorkflowSnapshot:
-    wf_state: str          # WORKFLOW_STARTED | WORKFLOW_TERMINATED | UNKNOWN
-    wf_status: Optional[int]   # exit status (0=success)
+    wf_state: str  # WORKFLOW_STARTED | WORKFLOW_TERMINATED | UNKNOWN
+    wf_status: Optional[int]  # exit status (0=success)
     wf_start: Optional[float]
     wf_end: Optional[float]
     jobs: List[JobRecord]
@@ -181,7 +205,7 @@ class WorkflowSnapshot:
     def elapsed(self) -> Optional[float]:
         if self.wf_start is None:
             return None
-        end = self.wf_end if self.wf_end else self.poll_time
+        end = self.wf_end if self.wf_end is not None else self.poll_time
         return end - self.wf_start
 
     def job_counts(self) -> Dict[str, int]:
@@ -230,6 +254,7 @@ class WorkflowSnapshot:
 
 # ─── Database class ───────────────────────────────────────────────────────────
 
+
 class StampedeDB:
     """Read-only interface to the Pegasus stampede SQLite database."""
 
@@ -254,9 +279,7 @@ class StampedeDB:
         if self._wf_uuid is None or self._conn is None:
             return
         cur = self._conn.cursor()
-        cur.execute(
-            "SELECT wf_id FROM workflow WHERE wf_uuid = ?", (self._wf_uuid,)
-        )
+        cur.execute("SELECT wf_id FROM workflow WHERE wf_uuid = ?", (self._wf_uuid,))
         row = cur.fetchone()
         if row:
             self._wf_id = row["wf_id"]
@@ -315,9 +338,7 @@ class StampedeDB:
                 (self._wf_id,),
             )
         else:
-            cur.execute(
-                "SELECT state, timestamp FROM workflowstate ORDER BY timestamp"
-            )
+            cur.execute("SELECT state, timestamp FROM workflowstate ORDER BY timestamp")
         start = end = None
         for row in cur.fetchall():
             if row["state"] == "WORKFLOW_STARTED":

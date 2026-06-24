@@ -89,68 +89,81 @@ class EventLogger:
         header_uuid: Optional[str] = None
         last_end_offset: Optional[int] = 0  # byte offset of last workflow_end line
 
+        # Read the whole log up front and track byte offsets manually. We cannot
+        # call ``fh.tell()`` inside a ``for line in fh`` loop — CPython disables
+        # tell() during line iteration (raises OSError "telling position
+        # disabled by next() call"), which previously aborted resume on the very
+        # first line. The log is append-only JSONL, so reading it once is cheap.
         try:
             with open(self._path) as fh:
-                offset = 0
-                for line in fh:
-                    raw = line.strip()
-                    if not raw:
-                        offset = fh.tell()
-                        continue
-                    ev = json.loads(raw)
-                    etype = ev.get("event_type")
-
-                    if etype == "workflow_start":
-                        header_uuid = ev.get("wf_uuid")
-
-                    elif etype == "workflow_state":
-                        self._last_wf_state = ev.get("state")
-
-                    elif etype == "job_state":
-                        ts = ev.get("timestamp", 0)
-                        if ts > self._high_water_ts:
-                            self._high_water_ts = ts
-
-                    elif etype == "jobs_init":
-                        self._jobs_init_emitted = True
-
-                    elif etype == "htcondor_poll":
-                        jobs = ev.get("jobs", [])
-                        self._last_condor_fingerprint = self._condor_fingerprint(jobs)
-
-                    elif etype == "htcondor_history":
-                        jobs = ev.get("jobs", [])
-                        self._last_history_fingerprint = self._history_fingerprint(jobs)
-
-                    elif etype == "pool_status":
-                        self._last_pool_fingerprint = self._pool_fingerprint(
-                            ev.get("pool", {})
-                        )
-
-                    elif etype == "workflow_end":
-                        last_end_offset = offset
-
-                    offset = fh.tell()
-        except (json.JSONDecodeError, OSError):
-            # Corrupted or unreadable — start fresh
+                lines = fh.readlines()
+        except OSError:
+            # Unreadable — start fresh
             return
+
+        offset = 0
+        for line in lines:
+            line_bytes = len(line.encode("utf-8"))
+            raw = line.strip()
+            if not raw:
+                offset += line_bytes
+                continue
+            try:
+                ev = json.loads(raw)
+            except json.JSONDecodeError:
+                # Corrupted line — start fresh
+                return
+            etype = ev.get("event_type")
+
+            if etype == "workflow_start":
+                header_uuid = ev.get("wf_uuid")
+
+            elif etype == "workflow_state":
+                self._last_wf_state = ev.get("state")
+
+            elif etype == "job_state":
+                ts = ev.get("timestamp", 0)
+                if ts > self._high_water_ts:
+                    self._high_water_ts = ts
+
+            elif etype == "jobs_init":
+                self._jobs_init_emitted = True
+
+            elif etype == "htcondor_poll":
+                jobs = ev.get("jobs", [])
+                self._last_condor_fingerprint = self._condor_fingerprint(jobs)
+
+            elif etype == "htcondor_history":
+                jobs = ev.get("jobs", [])
+                self._last_history_fingerprint = self._history_fingerprint(jobs)
+
+            elif etype == "pool_status":
+                self._last_pool_fingerprint = self._pool_fingerprint(ev.get("pool", {}))
+
+            elif etype == "workflow_end":
+                last_end_offset = offset
+
+            offset += line_bytes
 
         # Only resume if the existing log belongs to the same workflow
         if header_uuid is not None and header_uuid == self._wf_uuid:
             self._resumed = True
-            # Truncate any trailing workflow_end so new events append cleanly
+            # Truncate any trailing workflow_end so new events append cleanly.
+            # Operate in binary mode so the byte offset computed above is a
+            # well-defined seek target (text-mode seeks to arbitrary offsets are
+            # undefined; json.loads accepts bytes).
             if last_end_offset is not None and last_end_offset > 0:
-                with open(self._path, "r+") as fh:
-                    fh.seek(last_end_offset)
-                    rest = fh.read().strip()
-                    # Only truncate if workflow_end is the last event
-                    try:
+                try:
+                    with open(self._path, "rb+") as fh:
+                        fh.seek(last_end_offset)
+                        rest = fh.read().strip()
+                        # Only truncate if workflow_end is the last event
                         ev = json.loads(rest)
                         if ev.get("event_type") == "workflow_end":
                             fh.seek(last_end_offset)
                             fh.truncate()
-                    except (json.JSONDecodeError, ValueError):
-                        pass
+                except (json.JSONDecodeError, ValueError, OSError):
+                    pass
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 

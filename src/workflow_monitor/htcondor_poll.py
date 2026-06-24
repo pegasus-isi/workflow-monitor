@@ -24,6 +24,7 @@ import json
 import os
 import random
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -108,6 +109,165 @@ class CondorBackoff:
         if self.fail_streak == 0:
             return 0.0
         return max(0.0, self._retry_at - now)
+
+
+class CondorPoller:
+    """Per-cycle HTCondor polling with adaptive back-off and throttling.
+
+    Encapsulates the polling logic shared by the headless server and the live
+    TUI so a single monitoring cycle is testable without a loop, a TTY, or a
+    real scheduler:
+
+      * the live queue (:func:`query_queue`) is gated by a :class:`CondorBackoff`
+        so a failing/overloaded schedd is polled less and less often while the
+        caller keeps refreshing local state every cycle;
+      * history and pool are throttled to coarser intervals and skipped entirely
+        while the schedd is failing (``fail_streak > 0``);
+      * the last good result of each is cached and returned on a gated, failed,
+        or throttled cycle so the caller never flaps to an empty view.
+
+    Every poll takes an explicit ``now`` (defaulting to :func:`time.time`) so
+    tests can drive the cadence deterministically. ``poll_condor`` must run
+    before ``poll_history``/``poll_pool`` within a cycle — :meth:`poll` enforces
+    this — because the latter two consult the back-off streak the former updates.
+
+    ``on_condor_down`` (called once when the schedd first becomes unreachable,
+    with the raising exception) and ``on_condor_up`` (called once on recovery)
+    let the server log to stderr while the TUI stays silent and uses
+    :attr:`condor_offline` to drive a header badge instead.
+    """
+
+    def __init__(
+        self,
+        poll_interval: float,
+        condor_constraint: Optional[str] = None,
+        condor_kwargs: Optional[Dict[str, Any]] = None,
+        history_interval: Optional[float] = None,
+        pool_interval: Optional[float] = None,
+        on_condor_down: Optional[Callable[[Exception], None]] = None,
+        on_condor_up: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self._constraint = condor_constraint
+        self._ck = condor_kwargs or {}
+        self._backoff = CondorBackoff(poll_interval)
+        self._on_down = on_condor_down
+        self._on_up = on_condor_up
+
+        self._last_condor_jobs: List[Dict] = []
+        self._history_cache: List[Dict] = []
+        self._history_last_poll: Optional[float] = None
+        self._history_interval = (
+            history_interval
+            if history_interval is not None
+            else max(poll_interval * 3, 10.0)
+        )
+        self._pool_cache: Optional[PoolSummary] = None
+        self._pool_last_poll: Optional[float] = None
+        self._pool_interval = (
+            pool_interval if pool_interval is not None else max(poll_interval * 5, 15.0)
+        )
+
+    # ── State accessors ───────────────────────────────────────────────────────
+    @property
+    def backoff(self) -> CondorBackoff:
+        return self._backoff
+
+    @property
+    def condor_offline(self) -> bool:
+        """True while the schedd is in a failed back-off streak."""
+        return self._backoff.fail_streak > 0
+
+    @property
+    def history_cache(self) -> List[Dict]:
+        return self._history_cache
+
+    @property
+    def pool_cache(self) -> Optional[PoolSummary]:
+        return self._pool_cache
+
+    # ── Individual polls ────────────────────────────────────────────────────
+    def poll_condor(self, now: Optional[float] = None) -> List[Dict]:
+        """Poll the live queue through the back-off gate; reuse cache when gated."""
+        if now is None:
+            now = time.time()
+        if not self._backoff.due(now):
+            return self._last_condor_jobs  # gated — don't hit a struggling schedd
+        try:
+            jobs = query_queue(
+                constraint=self._constraint, raise_on_error=True, **self._ck
+            )
+        except Exception as exc:
+            first_failure = self._backoff.fail_streak == 0
+            self._backoff.record(False, now)
+            if first_failure and self._on_down is not None:
+                self._on_down(exc)
+            return self._last_condor_jobs
+        if self._backoff.record(True, now) and self._on_up is not None:
+            self._on_up()
+        self._last_condor_jobs = jobs
+        return jobs
+
+    def poll_history(self, now: Optional[float] = None) -> List[Dict]:
+        """Poll completed-job history on a throttled cadence; merge by ClusterId."""
+        if now is None:
+            now = time.time()
+        if self._backoff.fail_streak > 0:
+            return self._history_cache  # schedd failing — don't pile on more load
+        if (
+            self._history_last_poll is not None
+            and now - self._history_last_poll < self._history_interval
+        ):
+            return self._history_cache
+        try:
+            result = query_history(constraint=self._constraint, **self._ck)
+            if result:
+                seen = {h.get("ClusterId") for h in self._history_cache}
+                for h in result:
+                    cid = h.get("ClusterId")
+                    if cid not in seen:
+                        self._history_cache.append(h)
+                        seen.add(cid)
+        except Exception:
+            pass
+        self._history_last_poll = now
+        return self._history_cache
+
+    def poll_pool(self, now: Optional[float] = None) -> Optional[PoolSummary]:
+        """Poll pool slot status on a (coarser) throttled cadence."""
+        if now is None:
+            now = time.time()
+        if self._backoff.fail_streak > 0:
+            return self._pool_cache  # schedd failing — skip pool queries too
+        if (
+            self._pool_last_poll is not None
+            and now - self._pool_last_poll < self._pool_interval
+        ):
+            return self._pool_cache
+        try:
+            pool_kwargs: Dict[str, Any] = {}
+            for key in (
+                "collector_host",
+                "token_path",
+                "cert_path",
+                "key_path",
+                "password_file",
+            ):
+                if self._ck.get(key):
+                    pool_kwargs[key] = self._ck[key]
+            self._pool_cache = query_slots(**pool_kwargs)
+        except Exception:
+            pass
+        self._pool_last_poll = now
+        return self._pool_cache
+
+    def poll(self, now: Optional[float] = None) -> tuple:
+        """Run a full cycle: condor first (updates back-off), then history, pool."""
+        if now is None:
+            now = time.time()
+        condor_jobs = self.poll_condor(now)
+        history = self.poll_history(now)
+        pool = self.poll_pool(now)
+        return condor_jobs, history, pool
 
 
 # ─── Python bindings (preferred) ─────────────────────────────────────────────
@@ -555,7 +715,9 @@ def cpu_efficiency(ad: Dict) -> Optional[float]:
     try:
         wall_f = float(wall)
         cpu_f = float(user_cpu)
-        cpus_f = float(cpus) if cpus else 1.0
+        # Default only when RequestCpus is absent/None; a present 0 or negative
+        # must fall through to the guard below, not be silently rewritten to 1.
+        cpus_f = float(cpus) if cpus is not None else 1.0
         if wall_f <= 0 or cpus_f <= 0:
             return None
         return cpu_f / (wall_f * cpus_f)
