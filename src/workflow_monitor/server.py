@@ -20,13 +20,34 @@ from typing import Optional
 from .braindump import WorkflowInfo
 from .db import StampedeDB, WorkflowSnapshot
 from .event_log import EventLogger
-from .htcondor_poll import (
-    CondorBackoff,
-    PoolSummary,
-    query_history,
-    query_queue,
-    query_slots,
-)
+from .htcondor_poll import CondorPoller
+
+
+def _run_poll_cycle(
+    db: StampedeDB,
+    logger: EventLogger,
+    poller: CondorPoller,
+    diag_engine,
+) -> tuple:
+    """Run one server monitoring iteration and record it.
+
+    Reads a fresh stampede.db snapshot, polls condor/history/pool through the
+    back-off-aware :class:`~.htcondor_poll.CondorPoller`, writes the event-log
+    record, and (when enabled) runs the diagnostics engine. Returns
+    ``(snapshot, condor_jobs, history, pool)``. Extracted from the loop so a
+    single cycle is unit-testable without daemonizing, signals, or sleeping.
+    """
+    snap = db.snapshot()
+    condor_jobs, history, pool = poller.poll()
+    logger.record(snap, condor_jobs, history, pool)
+    if diag_engine is not None:
+        try:
+            diag_engine.tick(snap, condor_jobs, pool, logger.high_water_ts)
+        except Exception:
+            import traceback
+
+            traceback.print_exc()
+    return snap, condor_jobs, history, pool
 
 
 def _daemonize(pid_file: Path) -> None:
@@ -154,127 +175,38 @@ def run_server(
         print(f"Diagnostics enabled — sidecar: {diag_path}")
 
     # Adaptive gate: keep the loop (stampede.db) at base cadence, but poll the
-    # condor queue less often when the scheduler is failing.  Cache the last
-    # good result so a gated/failed cycle reuses it (and the fingerprint dedup
-    # emits nothing new) rather than flapping to an empty queue.
-    condor_backoff = CondorBackoff(poll_interval)
-    last_condor_jobs: list = []
-
-    def _poll_condor():
-        nonlocal last_condor_jobs
-        now = time.time()
-        if not condor_backoff.due(now):
-            return last_condor_jobs  # gated — do not hit a struggling schedd
-        try:
-            jobs = query_queue(constraint=condor_constraint, raise_on_error=True, **ck)
-        except Exception as exc:
-            if condor_backoff.fail_streak == 0:
-                print(
-                    f"[backoff] condor query failed ({exc}); polling less "
-                    f"frequently until the scheduler recovers",
-                    file=sys.stderr,
-                )
-            condor_backoff.record(False, now)
-            return last_condor_jobs
-        if condor_backoff.record(True, now):
-            print(
-                "[backoff] condor reachable again; resuming normal poll cadence",
-                file=sys.stderr,
-            )
-        last_condor_jobs = jobs
-        return jobs
-
-    # History cache with throttled polling
-    history_cache: list = []
-    history_last_poll: float = 0.0
-    history_interval = max(poll_interval * 3, 10.0)
-
-    def _poll_history():
-        nonlocal history_cache, history_last_poll
-        now = time.time()
-        # While the scheduler is failing, skip history too — don't pile more
-        # (already-throttled) queries onto a struggling schedd.
-        if condor_backoff.fail_streak > 0:
-            return history_cache
-        if now - history_last_poll < history_interval:
-            return history_cache
-        try:
-            result = query_history(constraint=condor_constraint, **ck)
-            if result:
-                seen = {h.get("ClusterId") for h in history_cache}
-                for h in result:
-                    if h.get("ClusterId") not in seen:
-                        history_cache.append(h)
-                        seen.add(h.get("ClusterId"))
-        except Exception:
-            pass
-        history_last_poll = now
-        return history_cache
-
-    # Pool status with throttled polling
-    pool_cache: Optional[PoolSummary] = None
-    pool_last_poll: float = 0.0
-    pool_interval = max(poll_interval * 5, 15.0)
-
-    def _poll_pool():
-        nonlocal pool_cache, pool_last_poll
-        now = time.time()
-        if condor_backoff.fail_streak > 0:
-            return pool_cache  # scheduler failing — skip pool queries too
-        if now - pool_last_poll < pool_interval:
-            return pool_cache
-        try:
-            pool_kwargs = {}
-            if ck.get("collector_host"):
-                pool_kwargs["collector_host"] = ck["collector_host"]
-            if ck.get("token_path"):
-                pool_kwargs["token_path"] = ck["token_path"]
-            if ck.get("cert_path"):
-                pool_kwargs["cert_path"] = ck["cert_path"]
-            if ck.get("key_path"):
-                pool_kwargs["key_path"] = ck["key_path"]
-            if ck.get("password_file"):
-                pool_kwargs["password_file"] = ck["password_file"]
-            pool_cache = query_slots(**pool_kwargs)
-        except Exception:
-            pass
-        pool_last_poll = now
-        return pool_cache
+    # condor queue less often when the scheduler is failing — the poller caches
+    # the last good result so a gated/failed cycle reuses it (and the fingerprint
+    # dedup emits nothing new) rather than flapping to an empty queue.
+    poller = CondorPoller(
+        poll_interval,
+        condor_constraint=condor_constraint,
+        condor_kwargs=ck,
+        on_condor_down=lambda exc: print(
+            f"[backoff] condor query failed ({exc}); polling less frequently "
+            f"until the scheduler recovers",
+            file=sys.stderr,
+        ),
+        on_condor_up=lambda: print(
+            "[backoff] condor reachable again; resuming normal poll cadence",
+            file=sys.stderr,
+        ),
+    )
 
     snap: Optional[WorkflowSnapshot] = None
 
     try:
         while not shutdown:
-            snap = db.snapshot()
-            condor_jobs = _poll_condor()
-            history = _poll_history()
-            pool = _poll_pool()
-            logger.record(snap, condor_jobs, history, pool)
-            if diag_engine is not None:
-                try:
-                    diag_engine.tick(snap, condor_jobs, pool, logger.high_water_ts)
-                except Exception:
-                    import traceback
-
-                    traceback.print_exc()
+            snap, _, _, _ = _run_poll_cycle(db, logger, poller, diag_engine)
 
             if snap.is_complete and not snap.is_running:
                 # One more poll for final DB flush
                 time.sleep(poll_interval)
-                snap = db.snapshot()
-                condor_jobs = _poll_condor()
-                history = _poll_history()
-                pool = _poll_pool()
-                logger.record(snap, condor_jobs, history, pool)
-                if diag_engine is not None:
-                    try:
-                        diag_engine.tick(snap, condor_jobs, pool, logger.high_water_ts)
-                    except Exception:
-                        pass
+                snap, _, _, _ = _run_poll_cycle(db, logger, poller, diag_engine)
                 break
 
             # Base cadence for the local DB/loop; the condor poll itself backs
-            # off internally via the CondorBackoff gate above.
+            # off internally via the poller's CondorBackoff gate.
             time.sleep(poll_interval)
     except Exception as exc:
         import traceback
@@ -283,7 +215,11 @@ def run_server(
         print(f"Server error: {exc}", file=sys.stderr)
     finally:
         if snap is not None:
-            logger.close(snap, condor_history=history_cache, pool_status=pool_cache)
+            logger.close(
+                snap,
+                condor_history=poller.history_cache,
+                pool_status=poller.pool_cache,
+            )
         else:
             logger.close()
         if diag_engine is not None:

@@ -23,3 +23,14 @@ workflow-monitor = "workflow_monitor.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/workflow_monitor"]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-cov>=7.1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+

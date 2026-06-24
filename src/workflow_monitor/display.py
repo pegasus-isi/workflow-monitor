@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from rich import box
 from rich.console import Console
@@ -30,10 +30,6 @@ from .diagnostics import collect_diagnostics
 from .event_log import EventLogger
 from .stats import WorkflowStats, compute_workflow_stats
 from .htcondor_poll import (
-    CondorBackoff,
-    query_queue,
-    query_history,
-    query_slots,
     format_job_status,
     format_resources,
     format_transfer,
@@ -858,90 +854,18 @@ def run_monitor(
     # Adaptive gate: the TUI keeps refreshing local DB state every cycle, but
     # the live condor queue is polled less often when the scheduler is failing
     # so a struggling schedd is never hammered and the UI never freezes. The
-    # last good queue is reused while gated/failed (no stderr output here — it
-    # would corrupt the full-screen Live; the state is shown via a header badge).
-    condor_backoff = CondorBackoff(poll_interval)
-    _last_condor_jobs: List = []
-
-    def _poll_condor() -> List:
-        nonlocal _last_condor_jobs
-        now = time.time()
-        if not condor_backoff.due(now):
-            return _last_condor_jobs
-        try:
-            jobs = query_queue(constraint=condor_constraint, raise_on_error=True, **ck)
-        except Exception:
-            condor_backoff.record(False, now)
-            return _last_condor_jobs
-        condor_backoff.record(True, now)
-        _last_condor_jobs = jobs
-        return jobs
-
-    # History cache: accumulates completed job records, refreshed every
-    # few poll cycles to avoid hammering condor_history each second.
-    _history_cache: List = []
-    _history_last_poll: float = 0.0
-    _HISTORY_INTERVAL = max(poll_interval * 3, 10.0)  # at least 10s
-
-    def _poll_history() -> List:
-        nonlocal _history_cache, _history_last_poll
-        now = time.time()
-        # While the scheduler is failing, skip history too (don't add load).
-        if condor_backoff.fail_streak > 0:
-            return _history_cache
-        if now - _history_last_poll < _HISTORY_INTERVAL:
-            return _history_cache
-        try:
-            result = query_history(constraint=condor_constraint, **ck)
-            if result:
-                # Merge into cache (dedup by ClusterId)
-                seen = {h.get("ClusterId") for h in _history_cache}
-                for h in result:
-                    cid = h.get("ClusterId")
-                    if cid not in seen:
-                        _history_cache.append(h)
-                        seen.add(cid)
-        except Exception:
-            pass
-        _history_last_poll = now
-        return _history_cache
-
-    # Pool status cache: polled less frequently (~15s)
-    _pool_cache: Optional[PoolSummary] = None
-    _pool_last_poll: float = 0.0
-    _POOL_INTERVAL = max(poll_interval * 5, 15.0)
-
-    def _poll_pool() -> Optional[PoolSummary]:
-        nonlocal _pool_cache, _pool_last_poll
-        now = time.time()
-        if condor_backoff.fail_streak > 0:
-            return _pool_cache  # scheduler failing — skip pool queries too
-        if now - _pool_last_poll < _POOL_INTERVAL:
-            return _pool_cache
-        try:
-            # Pool query uses collector_host but no per-workflow constraint
-            pool_kwargs = {}
-            if ck.get("collector_host"):
-                pool_kwargs["collector_host"] = ck["collector_host"]
-            if ck.get("token_path"):
-                pool_kwargs["token_path"] = ck["token_path"]
-            if ck.get("cert_path"):
-                pool_kwargs["cert_path"] = ck["cert_path"]
-            if ck.get("key_path"):
-                pool_kwargs["key_path"] = ck["key_path"]
-            if ck.get("password_file"):
-                pool_kwargs["password_file"] = ck["password_file"]
-            _pool_cache = query_slots(**pool_kwargs)
-        except Exception:
-            pass
-        _pool_last_poll = now
-        return _pool_cache
+    # last good queue is reused while gated/failed; unlike the server we pass no
+    # down/up callbacks (stderr output would corrupt the full-screen Live) — the
+    # offline state is surfaced via a header badge using poller.condor_offline.
+    poller = CondorPoller(
+        poll_interval,
+        condor_constraint=condor_constraint,
+        condor_kwargs=ck,
+    )
 
     def _refresh() -> tuple:
         snap = db.snapshot()
-        condor_jobs = _poll_condor()
-        history = _poll_history()
-        pool = _poll_pool()
+        condor_jobs, history, pool = poller.poll()
         ts = time.time()
         if logger is not None:
             logger.record(snap, condor_jobs, history, pool)
@@ -1031,7 +955,7 @@ def run_monitor(
                     else None,
                     diag_path=str(diag_engine.path) if diag_engine else None,
                     sort_by_activity=sort_by_activity,
-                    condor_offline=condor_backoff.fail_streak > 0,
+                    condor_offline=poller.condor_offline,
                 )
                 live.update(layout)
 
@@ -1055,7 +979,7 @@ def run_monitor(
                             else None,
                             diag_path=str(diag_engine.path) if diag_engine else None,
                             sort_by_activity=sort_by_activity,
-                            condor_offline=condor_backoff.fail_streak > 0,
+                            condor_offline=poller.condor_offline,
                         )
                     )
                     break
