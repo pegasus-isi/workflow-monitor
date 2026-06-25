@@ -157,7 +157,7 @@ class _FakeDB:
     def get_workflow_times(self):
         return {"start": self._snap.wf_start, "end": self._snap.wf_end}
 
-    def get_events_since(self, after_ts):
+    def get_events_since(self, after_ts, include_boundary=False):
         return []
 
 

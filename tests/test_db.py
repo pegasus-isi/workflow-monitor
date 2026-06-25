@@ -842,6 +842,23 @@ def test_get_events_since_boundary_is_exclusive(db_factory):
     assert [e["state"] for e in events] == ["EXECUTE"]
 
 
+def test_get_events_since_can_include_boundary(db_factory):
+    path = db_factory(
+        jobs=[
+            {
+                "job_id": 1,
+                "exec_job_id": "j1",
+                "type_desc": "compute",
+                "states": [("SUBMIT", 100.0), ("EXECUTE", 110.0)],
+            }
+        ]
+    )
+    with StampedeDB(path) as db:
+        events = db.get_events_since(100.0, include_boundary=True)
+    assert [e["state"] for e in events] == ["SUBMIT", "EXECUTE"]
+    assert {"job_instance_id", "jobstate_submit_seq"}.issubset(events[0])
+
+
 def test_get_events_since_returns_all_when_before_everything(diamond_db):
     with StampedeDB(diamond_db) as db:
         events = db.get_events_since(0.0)

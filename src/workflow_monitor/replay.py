@@ -104,7 +104,23 @@ class ReplayEngine:
         deduped: List[Dict[str, Any]] = []
         for ev in cleaned:
             if ev.get("event_type") == "job_state":
-                key = (ev.get("job_id"), ev.get("state"), ev.get("timestamp"))
+                if (
+                    ev.get("job_instance_id") is not None
+                    and ev.get("jobstate_submit_seq") is not None
+                ):
+                    key = (
+                        "row",
+                        ev.get("timestamp"),
+                        ev.get("job_instance_id"),
+                        ev.get("jobstate_submit_seq"),
+                    )
+                else:
+                    key = (
+                        "legacy",
+                        ev.get("job_id"),
+                        ev.get("state"),
+                        ev.get("timestamp"),
+                    )
                 if key in seen_job_states:
                     continue
                 seen_job_states.add(key)
@@ -256,6 +272,8 @@ class ReplayEngine:
                         js["stderr_file"] = ev["stderr_file"]
                     if ev.get("maxrss") is not None:
                         js["maxrss"] = ev["maxrss"]
+                    if ev.get("exitcode") is not None:
+                        js["exitcode"] = ev["exitcode"]
 
                     if state == "SUBMIT" and js["submit_time"] is None:
                         js["submit_time"] = ts

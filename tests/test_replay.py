@@ -175,6 +175,33 @@ def test_load_strips_extra_headers_dedups_and_keeps_last_end(tmp_path):
     assert len(submit_evs) == 1
 
 
+def test_load_preserves_distinct_job_state_rows_at_same_timestamp(tmp_path):
+    events = [
+        _header(ts=100.0),
+        {
+            "event_type": "job_state",
+            "job_id": 1,
+            "job_instance_id": 10,
+            "jobstate_submit_seq": 1,
+            "state": "SUBMIT",
+            "timestamp": 101.0,
+        },
+        {
+            "event_type": "job_state",
+            "job_id": 1,
+            "job_instance_id": 10,
+            "jobstate_submit_seq": 2,
+            "state": "SUBMIT",
+            "timestamp": 101.0,
+        },
+    ]
+
+    eng = _engine(tmp_path, events)
+
+    job_events = [ev for ev in eng._events if ev["event_type"] == "job_state"]
+    assert [ev["jobstate_submit_seq"] for ev in job_events] == [1, 2]
+
+
 def test_load_sorts_events_by_timestamp_stable(tmp_path):
     events = [
         _header(ts=100.0),
@@ -529,6 +556,31 @@ def test_reconstruct_captures_runtime_metadata(tmp_path):
     assert job_state[1]["stdout_file"] == "out.txt"
     assert job_state[1]["stderr_file"] == "err.txt"
     assert job_state[1]["maxrss"] == 4096
+
+
+def test_reconstruct_preserves_raw_exitcode(tmp_path):
+    eng = _fresh_engine(tmp_path)
+    job_state: Dict[int, Dict[str, Any]] = {}
+    snap, *_ = eng._reconstruct(
+        [
+            {
+                "event_type": "job_state",
+                "job_id": 1,
+                "state": "JOB_FAILURE",
+                "exitcode": 256,
+                "timestamp": 120.0,
+            }
+        ],
+        job_state,
+        "WORKFLOW_STARTED",
+        None,
+        100.0,
+        None,
+        [],
+        120.0,
+    )
+    assert job_state[1]["exitcode"] == 256
+    assert snap.jobs[0].exitcode == 256
 
 
 def test_reconstruct_workflow_end_sets_state_status_end(tmp_path):

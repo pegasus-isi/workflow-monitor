@@ -9,6 +9,7 @@ Usage (from cli.py):
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import tempfile
 import time
@@ -23,6 +24,9 @@ from .db import JobRecord, WorkflowSnapshot
 from .display import build_layout, _print_final_summary
 from .htcondor_poll import PoolSummary
 from .stats import WorkflowStats, compute_workflow_stats
+
+
+_REMOTE_TRUNCATED_EXIT = 75
 
 
 def _parse_remote_spec(spec: str) -> tuple[str, str]:
@@ -112,13 +116,22 @@ def _fetch_file(
     Returns (success, stderr_text, new_byte_offset).
     """
     ssh_host = _strip_brackets(host)
+    quoted_remote_path = shlex.quote(remote_path)
 
     if byte_offset > 0:
-        # tail -c +N outputs bytes starting at byte N (1-indexed)
-        remote_cmd = f"tail -c +{byte_offset + 1} {remote_path}"
+        # tail -c +N outputs bytes starting at byte N (1-indexed).  Check
+        # remote size first because tail beyond EOF succeeds with no output,
+        # which would otherwise hide a truncated/recreated event log forever.
+        remote_cmd = (
+            f"size=$(wc -c < {quoted_remote_path}) || exit 2; "
+            f'if [ "$size" -lt {byte_offset} ]; then '
+            f"exit {_REMOTE_TRUNCATED_EXIT}; "
+            "fi; "
+            f"tail -c +{byte_offset + 1} -- {quoted_remote_path}"
+        )
         write_mode = "ab"
     else:
-        remote_cmd = f"cat {remote_path}"
+        remote_cmd = f"cat -- {quoted_remote_path}"
         write_mode = "wb"
 
     cmd = ssh_base + [ssh_host, remote_cmd]
@@ -130,6 +143,8 @@ def _fetch_file(
         if result.returncode == 0:
             new_size = local_path.stat().st_size
             return True, "", new_size
+        if result.returncode == _REMOTE_TRUNCATED_EXIT:
+            return True, "", 0
         # On failure with incremental fetch, the local file may have
         # garbage appended — truncate back to the previous offset.
         if byte_offset > 0:
@@ -373,8 +388,7 @@ class RemoteEngine:
                 js["raw_state"] = state
                 ts = ev.get("timestamp")
                 if ev.get("exitcode") is not None:
-                    from .db import real_exitcode
-                    js["exitcode"] = real_exitcode(ev["exitcode"])
+                    js["exitcode"] = ev["exitcode"]
                 # Capture runtime metadata when present
                 if ev.get("stdout_file"):
                     js["stdout_file"] = ev["stdout_file"]
