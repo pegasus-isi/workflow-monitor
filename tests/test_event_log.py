@@ -312,6 +312,43 @@ def test_job_state_advances_high_water_across_calls(db_factory, info, clock, tmp
     assert logger.high_water_ts == 151.0
 
 
+def test_job_state_same_timestamp_late_row_not_skipped(
+    db_factory, info, clock, tmp_path
+):
+    path = db_factory(
+        jobs=_basic_jobs(), wf_states=_started_wf_states(), name="wf.stampede.db"
+    )
+    db = StampedeDB(path, wf_uuid="test-wf-uuid")
+    db.connect()
+    logger = _make_logger(info, db, tmp_path)
+    logger.record(db.snapshot())
+    assert logger.high_water_ts == 110.0
+    db.close()
+
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "INSERT INTO jobstate (job_instance_id, state, timestamp, jobstate_submit_seq)"
+        " VALUES (1, 'JOB_TERMINATED', 110.0, 999)"
+    )
+    conn.commit()
+    conn.close()
+
+    db2 = StampedeDB(path, wf_uuid="test-wf-uuid")
+    db2.connect()
+    logger._db = db2
+    logger.record(db2.snapshot())
+    logger.record(db2.snapshot())
+    db2.close()
+
+    js = [
+        e["state"] for e in read_events(logger.path) if e["event_type"] == "job_state"
+    ]
+    assert js == ["SUBMIT", "EXECUTE", "JOB_TERMINATED"]
+    assert logger.high_water_ts == 110.0
+
+
 def test_job_state_optional_fields(info, open_db, clock, tmp_path):
     # A fully-attributed terminal job: exitcode, stdout/stderr, maxrss present.
     jobs = [

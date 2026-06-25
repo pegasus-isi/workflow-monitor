@@ -431,12 +431,22 @@ class StampedeDB:
             )
         return jobs
 
-    def get_events_since(self, after_ts: float) -> List[Dict]:
-        """Return all job-state transitions after *after_ts*, ordered ASC."""
+    def get_events_since(
+        self, after_ts: float, include_boundary: bool = False
+    ) -> List[Dict]:
+        """Return job-state transitions after *after_ts*, ordered ASC.
+
+        By default the timestamp boundary is exclusive. Event-log resume uses
+        ``include_boundary=True`` with per-row deduplication so rows inserted
+        later with the same timestamp are not skipped.
+        """
         cur = self._conn_or_raise().cursor()
+        op = ">=" if include_boundary else ">"
         cur.execute(
-            """
+            f"""
             SELECT
+                ji.job_instance_id,
+                js.jobstate_submit_seq,
                 j.exec_job_id,
                 j.type_desc,
                 js.state,
@@ -451,7 +461,7 @@ class StampedeDB:
             FROM job j
             JOIN job_instance ji ON j.job_id = ji.job_id
             JOIN jobstate js ON ji.job_instance_id = js.job_instance_id
-            WHERE js.timestamp > ?
+            WHERE js.timestamp {op} ?
               AND (? IS NULL OR j.wf_id = ?)
             ORDER BY js.timestamp ASC, js.jobstate_submit_seq ASC
             """,

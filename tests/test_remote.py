@@ -1,10 +1,10 @@
 """Unit tests for :mod:`workflow_monitor.remote`.
 
-These tests exercise the pure parsing helpers and the event-application /
-snapshot-reconstruction path of :class:`RemoteEngine` WITHOUT any real SSH or
-network access.  ``_fetch_file`` / ``subprocess`` are never invoked; we drive
-the engine by writing JSONL directly into its local cache file and calling the
-loader/apply methods, mirroring the replay reconstruction semantics.
+These tests exercise the parsing helpers, SSH fetch command construction, and
+event-application / snapshot-reconstruction path of :class:`RemoteEngine`
+WITHOUT any real SSH or network access.  Engine state is driven by writing
+JSONL directly into its local cache file and calling the loader/apply methods,
+mirroring the replay reconstruction semantics.
 
 ``RemoteEngine.run()`` is intentionally NOT exercised here — it enters a Rich
 ``Live`` TUI loop with real ``time.sleep`` and (in non-``once`` mode) blocks
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -150,6 +151,87 @@ def test_build_ssh_base_with_config_and_identity_order():
         "-i",
         "/key",
     ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _fetch_file command construction / truncation detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_fetch_file_quotes_full_remote_path(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, stdout, stderr, timeout):
+        calls.append(cmd)
+        stdout.write(b"line\n")
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(remote.subprocess, "run", fake_run)
+    local = tmp_path / "events.jsonl"
+
+    ok, err, offset = remote._fetch_file(
+        "user@host",
+        "/tmp/workflow events;rm.jsonl",
+        local,
+        ["ssh"],
+    )
+
+    assert ok is True
+    assert err == ""
+    assert offset == len(b"line\n")
+    assert local.read_bytes() == b"line\n"
+    assert calls[0][-1] == "cat -- '/tmp/workflow events;rm.jsonl'"
+
+
+def test_fetch_file_quotes_incremental_remote_path(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, stdout, stderr, timeout):
+        calls.append(cmd)
+        stdout.write(b"new\n")
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(remote.subprocess, "run", fake_run)
+    local = tmp_path / "events.jsonl"
+    local.write_bytes(b"old\n")
+
+    ok, err, offset = remote._fetch_file(
+        "user@host",
+        "/tmp/workflow events;rm.jsonl",
+        local,
+        ["ssh"],
+        byte_offset=4,
+    )
+
+    assert ok is True
+    assert err == ""
+    assert offset == len(b"old\nnew\n")
+    assert local.read_bytes() == b"old\nnew\n"
+    remote_cmd = calls[0][-1]
+    assert "wc -c < '/tmp/workflow events;rm.jsonl'" in remote_cmd
+    assert "tail -c +5 -- '/tmp/workflow events;rm.jsonl'" in remote_cmd
+
+
+def test_fetch_file_reports_remote_truncation(tmp_path, monkeypatch):
+    def fake_run(cmd, stdout, stderr, timeout):
+        return SimpleNamespace(returncode=remote._REMOTE_TRUNCATED_EXIT, stderr=b"")
+
+    monkeypatch.setattr(remote.subprocess, "run", fake_run)
+    local = tmp_path / "events.jsonl"
+    local.write_bytes(b"0123456789")
+
+    ok, err, offset = remote._fetch_file(
+        "user@host",
+        "/tmp/events.jsonl",
+        local,
+        ["ssh"],
+        byte_offset=10,
+    )
+
+    assert ok is True
+    assert err == ""
+    assert offset == 0
+    assert local.read_bytes() == b"0123456789"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -399,8 +481,8 @@ def test_apply_job_state_terminal_sets_end_time(engine):
     assert engine._job_state[1]["end_time"] == 50.0
 
 
-def test_apply_job_state_exitcode_decoded(engine):
-    # raw wait-status 256 -> real exit code 1 (256 >> 8).
+def test_apply_job_state_exitcode_preserves_raw_wait_status(engine):
+    # JobRecord consumers decode raw Stampede wait status at presentation time.
     engine._apply_event(
         {
             "event_type": "job_state",
@@ -410,7 +492,7 @@ def test_apply_job_state_exitcode_decoded(engine):
             "exitcode": 256,
         }
     )
-    assert engine._job_state[1]["exitcode"] == 1
+    assert engine._job_state[1]["exitcode"] == 256
 
 
 def test_apply_job_state_captures_runtime_metadata(engine):

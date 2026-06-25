@@ -63,6 +63,7 @@ class EventLogger:
         self._last_condor_fingerprint: frozenset[tuple] = frozenset()
         self._last_history_fingerprint: frozenset[tuple] = frozenset()
         self._last_pool_fingerprint: Optional[str] = None
+        self._seen_job_events: set[tuple] = set()
         self._jobs_init_emitted: bool = False
         self._resumed: bool = False
 
@@ -125,6 +126,7 @@ class EventLogger:
                 ts = ev.get("timestamp", 0)
                 if ts > self._high_water_ts:
                     self._high_water_ts = ts
+                self._seen_job_events.add(self._job_event_key(ev))
 
             elif etype == "jobs_init":
                 self._jobs_init_emitted = True
@@ -375,6 +377,32 @@ class EventLogger:
 
     # ── Event detection ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _job_event_key(ev: Dict[str, Any]) -> tuple:
+        """Stable identity for a Stampede job-state row.
+
+        New logs include the source ``job_instance_id`` and
+        ``jobstate_submit_seq`` so same-timestamp events remain distinct.
+        Older logs are still resumable via the legacy tuple.
+        """
+        if (
+            ev.get("job_instance_id") is not None
+            and ev.get("jobstate_submit_seq") is not None
+        ):
+            return (
+                "row",
+                ev.get("timestamp"),
+                ev.get("job_instance_id"),
+                ev.get("jobstate_submit_seq"),
+            )
+        return (
+            "legacy",
+            ev.get("timestamp"),
+            ev.get("job_id"),
+            ev.get("state"),
+            ev.get("exec_job_id"),
+        )
+
     def _emit_jobs_init(self, snapshot: WorkflowSnapshot) -> None:
         """Emit a jobs_init event listing the full job roster from the first snapshot."""
         jobs = []
@@ -416,8 +444,11 @@ class EventLogger:
             self._last_wf_state = snapshot.wf_state
 
     def _record_job_events(self) -> None:
-        events = self._db.get_events_since(self._high_water_ts)
+        events = self._db.get_events_since(self._high_water_ts, include_boundary=True)
         for ev in events:
+            key = self._job_event_key(ev)
+            if key in self._seen_job_events:
+                continue
             record: Dict[str, Any] = {
                 "event_type": "job_state",
                 "timestamp": ev["timestamp"],
@@ -426,6 +457,10 @@ class EventLogger:
                 "state": ev["state"],
                 "job_id": ev["job_id"],
             }
+            if ev.get("job_instance_id") is not None:
+                record["job_instance_id"] = ev["job_instance_id"]
+            if ev.get("jobstate_submit_seq") is not None:
+                record["jobstate_submit_seq"] = ev["jobstate_submit_seq"]
             if ev.get("exitcode") is not None:
                 record["exitcode"] = ev["exitcode"]
             if ev.get("stdout_file"):
@@ -435,6 +470,7 @@ class EventLogger:
             if ev.get("maxrss") is not None:
                 record["maxrss"] = ev["maxrss"]
             self._emit(record)
+            self._seen_job_events.add(key)
             if ev["timestamp"] > self._high_water_ts:
                 self._high_water_ts = ev["timestamp"]
 
